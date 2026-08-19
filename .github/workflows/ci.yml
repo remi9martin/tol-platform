@@ -1,0 +1,136 @@
+name: CI
+
+# Gate: P18 Security (".github/workflows" is one of P18's owning paths) —
+# and, once this exists, indirectly every other gate whose tests now
+# actually run somewhere.
+#
+# AUTHORED, NOT YET EXERCISED: there is no GitHub remote wired up for this
+# repo yet (see ../../docs/security/README.md "CI is authored, not yet
+# exercised"). Every command below is the REAL root script (see
+# package.json) and the REAL env-var contract (.env.example,
+# packages/config/src/env.ts) — this was built by reading the actual repo,
+# not templated — but it has never run on an actual GitHub-hosted runner.
+#
+# Action-version note: authored 2026-08-18, in the middle of GitHub's
+# Node 20 -> Node 24 runner migration (Node 20 fully removed from
+# GitHub-hosted runners 2026-09-16). actions/checkout@v5, actions/
+# setup-node@v6, and pnpm/action-setup@v4 were the current, verified-live
+# major versions at authoring time. Re-check for a newer major the first
+# time this workflow is actually exercised — pin versions were confirmed
+# via live search, not memory, but "current" has a short shelf life on
+# GitHub Actions right now.
+
+on:
+  push:
+    branches: [master] # tol-platform's actual current default branch (verified via .git/HEAD) — update if the default branch is ever renamed.
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ---- Values that mirror .env.example's REAL DEV DEFAULTS ----
+  # tol/changeme is .env.example's own documented placeholder credential
+  # ("All values below are placeholders, not real secrets") for the local
+  # dev Postgres — reused verbatim here for the CI-only service container
+  # below. Never a production credential.
+  DATABASE_URL: postgresql://tol:changeme@localhost:5432/tol_platform
+  NODE_ENV: test
+
+  # ---- CI-only dummy secrets, required by packages/config/src/env.ts's
+  # fail-loud getConfig() so apps/api can even construct during
+  # typecheck/build/test. These are NOT real secrets — they are fixed,
+  # committed-in-plaintext placeholder values that exist ONLY to satisfy
+  # format validation on an ephemeral runner talking to a throwaway
+  # Postgres container that is destroyed at the end of the job. The real
+  # equivalents (a KMS/HSM in production per ADR-0009) must never
+  # be committed anywhere, including here. .gitleaks.toml's allowlist
+  # explicitly recognizes these exact literals so the security.yml scan
+  # doesn't flag its own CI config as a leaked key. ----
+
+  # packages/config/src/env.ts requires >= 32 chars (it HMAC-signs session
+  # tokens — apps/api/src/shared/session.ts's hashSessionToken).
+  SESSION_SECRET: ci-only-dummy-session-secret-never-used-outside-ephemeral-test-runs
+
+  # packages/crypto/src/keys.ts's parseKeyHex requires EXACTLY 64 hex
+  # characters (32 bytes) for each of these four, or apps/api's lockbox
+  # module throws MissingKeyMaterialError at construction — which would
+  # fail EVERY test that boots the Fastify app, not just lockbox tests.
+  LOCKBOX_KEK_SEALER: "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4"
+  LOCKBOX_KEK_OPERATOR: "e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718"
+  LOCKBOX_KEK_ESCROW: "293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c"
+  LOCKBOX_RECEIPT_HMAC_KEY: "6d7e8f906d7e8f906d7e8f906d7e8f906d7e8f906d7e8f906d7e8f906d7e8f90"
+
+jobs:
+  build-test:
+    name: typecheck / build / test
+    runs-on: ubuntu-latest
+
+    # Mirrors docker-compose.yml's real postgres service (same image tag,
+    # same user/password/db) — apps/api and packages/db's test suites talk
+    # to a real Postgres, not a mock (all 83 of apps/api's tests
+    # re-executed against the real Postgres and passed). Only postgres is
+    # needed for typecheck/build/test — redis/minio/mailpit (also in
+    # docker-compose.yml) have no consumer wired to them yet per that
+    # file's own header comment.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tol
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: tol_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tol"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Must run BEFORE actions/setup-node's cache:'pnpm' below — that
+      # cache mode shells out to `pnpm store path`, which requires pnpm to
+      # already be on PATH.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        # No `version:` input — package.json pins "packageManager":
+        # "pnpm@9.15.0"; action-setup reads that automatically, so this
+        # can never drift out of sync with the repo's own pin.
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: ".nvmrc" # repo pins Node 24 here; package.json's engines field ("node": ">=20.9.0") is the looser floor, .nvmrc is the actual dev/CI target.
+          cache: "pnpm"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # Explicit, even though @prisma/client's own postinstall often
+      # generates the client automatically — this makes CI's Prisma-client
+      # freshness independent of postinstall-hook timing/pnpm-hoisting
+      # quirks rather than relying on it implicitly.
+      - name: Generate Prisma client
+        run: pnpm --filter @tol/db run prisma:generate
+
+      # DATABASE_URL above points at the service container on localhost —
+      # service containers on a non-containerized job (this one runs
+      # directly on the ubuntu-latest runner, not inside a `container:`)
+      # are reachable at localhost via their `ports` mapping.
+      - name: Apply Prisma migrations
+        run: pnpm --filter @tol/db run prisma:migrate:deploy
+
+      - name: Typecheck
+        run: pnpm -w run typecheck
+
+      - name: Build
+        run: pnpm -w run build
+
+      - name: Test
+        run: pnpm -w run test

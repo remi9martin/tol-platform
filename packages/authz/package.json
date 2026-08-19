@@ -1,0 +1,22 @@
+{
+  "name": "@tol/authz",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Hybrid RBAC + object/purpose-based policy (the spec, p.11, p.27). Exposes can(actor, action, resource, context) and fieldPolicy(actor, resource). apps/api's services and apps/web's affordance rendering both call this — the UI never enforces, only reflects.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "devDependencies": {
+    "@prisma/client": "6.19.3",
+    "@tol/db": "workspace:*",
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

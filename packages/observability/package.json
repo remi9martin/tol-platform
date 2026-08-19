@@ -1,0 +1,14 @@
+{
+  "name": "@tol/observability",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Structured JSON logging, tracing, metrics (the spec). Feeds health/readiness endpoints and alerting. Redaction is mandatory — no sensitive payloads in logs or error tracking (unit-tested, per the spec).",
+  "type": "module",
+  "scripts": {
+    "build": "echo \"@tol/observability: no build defined yet (earlier skeleton)\"",
+    "lint": "echo \"@tol/observability: no lint defined yet (earlier skeleton)\"",
+    "test": "echo \"@tol/observability: no tests defined yet (earlier skeleton)\""
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts"
+}

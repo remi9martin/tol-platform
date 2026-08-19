@@ -1,0 +1,25 @@
+{
+  "name": "@tol/queue",
+  "version": "0.0.0",
+  "private": true,
+  "description": "earlier: the shared apps/api <-> apps/worker job contract — queue/job names, per-job data shapes, and typed enqueue functions apps/api calls directly (never BullMQ/ioredis specifics leaking into apps/api's own service code, same 'packages own the mechanism, apps consume it' discipline as every other package in this monorepo). apps/worker's own job PROCESSING (handlers, registry, worker-runtime) stays in apps/worker — this package is the producer-side contract both apps share, not the consumer.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@tol/config": "workspace:*",
+    "bullmq": "6.1.2",
+    "ioredis": "5.11.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

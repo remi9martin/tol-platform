@@ -1,0 +1,260 @@
+/* ============================================================
+   TOL — TRUST ONLINE — PLATFORM (canonical apps/web theme)
+
+   Ported from ../../../the prototype repo/app/globals.css (the pre-scope
+   prototype) per DISCREPANCY_REPORT.md §7's reuse guidance — the token
+   values are carried over near-verbatim (this IS the theme, not a
+   redesign), but this file lives fresh in the canonical monorepo rather
+   than being copied byte-for-byte, since the prototype itself is kept as
+   untouched reference material (README.md: "not part of this
+   workspace"). "TOL — Trust Online" is a WORKING NAME ONLY — see
+   ADR-0003 (trademark/domain clearance required before any
+   public/investor-facing use).
+
+   Near-black ground, one red hue family in four tonal steps, clean
+   near-white ink. Institutional, premium, dark cinematic. Restrained on
+   purpose.
+   ============================================================ */
+
+@import "tailwindcss";
+
+@theme {
+  /* ground */
+  --color-ground: #0a0706;
+  --color-ground-2: #0d0908;
+  --color-panel: #150f0e;
+  --color-panel-2: #1d1413;
+  --color-edge: rgba(255, 80, 80, 0.14);
+  --color-edge-2: rgba(255, 80, 80, 0.3);
+
+  /* signal fields — one hue family, four tonal steps */
+  --color-crimson: #e01020;
+  --color-red-lt: #ff5a68;
+  --color-coral: #ff8577;
+  --color-red: #ff2436;
+  --color-amber: #ff7a2e;
+  --color-oxblood: #e39098;
+  --color-oxblood-2: #b33044;
+
+  /* status (kept inside the restrained palette — green/amber used only for
+     yes/no ledger states, never as a competing brand hue) */
+  --color-ok: #3ecf8e;
+  --color-ok-ink: #b8f0d0;
+  --color-warn: #ff7a2e;
+  --color-warn-ink: #ffd3a6;
+
+  /* ink */
+  --color-ink: #f7f3f1;
+  --color-ink-2: #d6cbc8;
+  --color-ink-3: #998683;
+
+  --font-sans:
+    "Segoe UI Variable Display", "Segoe UI", -apple-system, BlinkMacSystemFont,
+    system-ui, "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  --radius-card: 10px;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-ground);
+  color: var(--color-ink-2);
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::selection {
+  background: rgba(255, 36, 54, 0.28);
+  color: #fff;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-red);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+a {
+  color: var(--color-coral);
+}
+
+/* ambient ground glow */
+.tol-ground::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(1100px 620px at 82% -10%, rgba(224, 16, 32, 0.14), transparent 60%),
+    radial-gradient(820px 520px at 4% 8%, rgba(179, 48, 68, 0.09), transparent 58%),
+    radial-gradient(900px 600px at 50% 112%, rgba(255, 122, 46, 0.07), transparent 60%);
+}
+
+/* thin, brand-consistent scrollbars on the dark ground */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 80, 80, 0.3) transparent;
+}
+*::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 80, 80, 0.28);
+  border-radius: 99px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  .panel {
+    background: var(--color-panel);
+    border: 1px solid var(--color-edge);
+    border-radius: var(--radius-card);
+  }
+
+  .panel-2 {
+    background: var(--color-panel-2);
+    border: 1px solid var(--color-edge);
+    border-radius: var(--radius-card);
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4em;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 4px;
+    white-space: nowrap;
+    line-height: 1.6;
+  }
+
+  .chip-red {
+    color: #ffb9b3;
+    background: rgba(224, 16, 32, 0.14);
+    border: 1px solid rgba(255, 90, 104, 0.4);
+  }
+
+  .chip-ok {
+    color: var(--color-ok-ink);
+    background: rgba(62, 207, 142, 0.14);
+    border: 1px solid rgba(70, 210, 150, 0.4);
+  }
+
+  .chip-warn {
+    color: var(--color-warn-ink);
+    background: rgba(255, 122, 46, 0.14);
+    border: 1px solid rgba(255, 122, 46, 0.42);
+  }
+
+  .chip-neutral {
+    color: var(--color-ink-3);
+    background: rgba(255, 80, 80, 0.06);
+    border: 1px solid var(--color-edge);
+  }
+
+  .scrollx {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .mono-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--color-ink-3);
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6em;
+    font-family: var(--font-sans);
+    font-size: 13.5px;
+    font-weight: 650;
+    letter-spacing: -0.006em;
+    padding: 10px 18px;
+    border-radius: 6px;
+    text-decoration: none;
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition:
+      transform 0.2s cubic-bezier(0.16, 0.84, 0.34, 1),
+      box-shadow 0.2s cubic-bezier(0.16, 0.84, 0.34, 1),
+      background 0.2s cubic-bezier(0.16, 0.84, 0.34, 1),
+      border-color 0.2s cubic-bezier(0.16, 0.84, 0.34, 1);
+  }
+  .btn:hover {
+    transform: translateY(-1px);
+  }
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+  }
+  .btn-go {
+    background: linear-gradient(100deg, var(--color-red), var(--color-amber));
+    color: #150502;
+    border-color: rgba(255, 150, 140, 0.9);
+    box-shadow: 0 10px 24px -14px rgba(0, 0, 0, 0.9);
+  }
+  .btn-go:hover:not(:disabled) {
+    background: linear-gradient(100deg, #ff7a6e, var(--color-red));
+  }
+  .btn-ghost {
+    border-color: var(--color-edge-2);
+    color: var(--color-ink);
+    background: rgba(255, 80, 80, 0.05);
+  }
+  .btn-ghost:hover:not(:disabled) {
+    border-color: var(--color-coral);
+    background: rgba(255, 133, 119, 0.09);
+  }
+  .btn-ghost.is-active {
+    border-color: var(--color-red);
+    background: rgba(255, 36, 54, 0.12);
+    color: var(--color-ink);
+  }
+
+  .field-input {
+    background: var(--color-panel-2);
+    border: 1px solid var(--color-edge-2);
+    border-radius: 6px;
+    color: var(--color-ink);
+    padding: 10px 12px;
+    font-size: 14px;
+    width: 100%;
+  }
+  .field-input:focus {
+    outline: none;
+    border-color: var(--color-red);
+  }
+  .field-error {
+    color: var(--color-oxblood);
+    font-size: 12.5px;
+    margin-top: 4px;
+  }
+}

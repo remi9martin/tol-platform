@@ -1,0 +1,77 @@
+name: Security
+
+# Gate: P18 Security — exit condition is "Authz/redaction/secret scans +
+# threat review." This workflow is the "secret scans" half (authz/redaction
+# is packages/authz's own test suite — can.test.ts, matrix.test.ts,
+# field-policy.test.ts, roles.consistency.test.ts — which already runs
+# under ci.yml's `pnpm -w run test`; "threat review" is
+# ../../docs/security/threat-model.md, a document, not a job).
+#
+# AUTHORED, NOT YET EXERCISED — see ci.yml's header comment for the same
+# disclaimer (no GitHub remote yet, action versions verified live at
+# authoring time on 2026-08-18, re-check before first real run).
+#
+# Two scans, per the P18 brief:
+#   1. gitleaks   — secret scanning. FAILS THE JOB on any finding (no
+#                   continue-on-error — this is the one hard gate here).
+#   2. pnpm audit — dependency vulnerability scanning at high+ severity.
+
+on:
+  push:
+    branches: [master] # see ci.yml's note — tol-platform's real current default branch.
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC — catches newly-disclosed CVEs in unchanged dependencies, and a slow/periodic secret-history sweep.
+  workflow_dispatch:
+
+jobs:
+  gitleaks:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # gitleaks needs real commit history to scan past commits, not just the working tree.
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # always available automatically — used to comment findings on PRs.
+          # Only required if this repo is ever moved under a GitHub
+          # Organization account — personal-account repos don't need a
+          # license (verified live, gitleaks/gitleaks-action docs,
+          # 2026-08-18). Resolves to an empty string and is harmless for
+          # a personal-account repo if the secret is never set.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        # No `continue-on-error` — a real secret finding must fail this
+        # job (P18 brief: "Fail the job on secrets found"). Config:
+        # ../../.gitleaks.toml (repo root, gitleaks' default discovery
+        # path — no --config flag needed).
+
+  dependency-audit:
+    name: Dependency vulnerability scan (pnpm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: ".nvmrc"
+          cache: "pnpm"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm audit (high + critical)
+        run: pnpm audit --audit-level=high
+        # Deliberately blocking (no continue-on-error): a high/critical
+        # advisory in a resolved dependency is a real, actionable gate.
+        # If this becomes noisy with un-actionable transitive advisories
+        # later, scope it down with `--prod` or a documented ignore list
+        # — don't silently make it non-blocking.

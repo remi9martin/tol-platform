@@ -1,0 +1,2643 @@
+// packages/db/prisma/schema.prisma
+//
+// earlier slice: Organization / Person / User / OrganizationMembership / Role
+// (persona enum) / Session / AuditEvent / IdempotencyKey.
+//
+// Grounded directly in tol_scope.txt:
+//   p.4   — Personas table (10 personas) + tenant/object access rules +
+//           DisclosureClass six-value list (superseded by ADR-0005,
+//           which uses p.12's RESTRICTED instead of p.4's RESTRICTED_OPERATOR)
+//   p.12  — Canonical Data Model: ID convention, money/bps/percentage
+//           conventions, versioning, soft-deletion, base audit columns
+//   p.13  — Organization / Person / OrganizationMembership key fields
+//   p.27  — Auth: session cookies HttpOnly/Secure/SameSite, CSRF, MFA for
+//           operator/admin, hybrid RBAC + object/purpose policy
+//
+// NOT in this file (deliberately, per earlier scope = "monorepo, auth, orgs,
+// roles, DB, shell, audit base" — p.32): Relationship/RelationshipClaim/
+// ClaimEvidence/ClaimScope/etc (p.13), Passport/Fact/Evidence (p.14),
+// Opportunity/Capacity (p.15-16), Lockbox (p.17), RFQ/DealRoom (p.21-22),
+// Economics (p.23). Those are earlier+ per ADR-0002's resequencing.
+// Building them now would violate the explicit "do NOT race to earlier"
+// instruction for this pass.
+//
+// Version pin: prisma/@prisma/client 6.19.3 (latest 6.x), NOT the newly
+// released Prisma 7 line. Prisma 7 mandates driver adapters, a renamed
+// generator ("prisma-client"), moving datasource url out of schema.prisma
+// into prisma.config.ts, and explicit env loading — a materially different,
+// less-established workflow. For an earlier foundational package everything
+// else depends on, the well-documented 6.x workflow (traditional
+// "prisma-client-js" generator, datasource url in-schema, @prisma/client
+// import) is the lower-risk, more verifiable choice. Revisit the 7.x
+// upgrade deliberately on a later day, not as a side effect of earlier.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =================================================================
+// Enums
+// =================================================================
+
+/// The persona/authority matrix from the spec. Counted directly from the
+/// page's persona table during this build (10 rows: Platform Owner,
+/// Marketplace Operator, Partnership Lead, Underwriting/Readiness Analyst,
+/// Compliance Reviewer, Finance Operator, Contributor/Agent, Merchant/PSP
+/// User, Acquirer/Provider User, Auditor/Read-only). Prior repo docs
+/// (the build log, the discrepancy report) say "nine personas" — that
+/// appears to be an undercount against the primary source; this schema
+/// uses all 10 rows actually present on p.4, verified by direct read
+/// during this build rather than deferring to the inherited count.
+enum PersonaRole {
+  PLATFORM_OWNER
+  MARKETPLACE_OPERATOR
+  PARTNERSHIP_LEAD
+  UNDERWRITING_ANALYST
+  COMPLIANCE_REVIEWER
+  FINANCE_OPERATOR
+  CONTRIBUTOR_AGENT
+  MERCHANT_PSP_USER
+  ACQUIRER_PROVIDER_USER
+  AUDITOR_READONLY
+}
+
+/// Canonical six-value disclosure/data-class enum per ADR-0005
+/// (= the spec's list, not p.4's or p.22's variants).
+enum DisclosureClass {
+  PUBLIC_MARKET
+  MEMBER_MARKET
+  MATCH_SUMMARY
+  DEAL_ROOM
+  RESTRICTED
+  SECRET
+}
+
+/// Not enumerated explicitly by the scope text on p.13 (Organization's
+/// "entityType" field is named but its allowed values aren't listed
+/// verbatim anywhere in the 33 pages). Inferred from the persona/role
+/// framing used consistently across p.4/p.6/p.13/p.15-16 (Merchant, PSP,
+/// Acquirer, Provider are the counterparty types the marketplace connects;
+/// PLATFORM covers TOL's own operating entity; PARTNER/OTHER are escape
+/// hatches). Flagged here as an inference, not a verbatim scope quote.
+enum OrganizationType {
+  PLATFORM
+  MERCHANT
+  PSP
+  ACQUIRER
+  PROVIDER
+  PARTNER
+  OTHER
+}
+
+/// Also inferred (see OrganizationType comment) — p.13 names
+/// "verificationStatus" as a Person and Organization field without
+/// enumerating values. This is deliberately a different, simpler set than
+/// the Passport state machine (DRAFT/INCOMPLETE/READY/VERIFIED/STALE/
+/// SUSPENDED, p.5) since Passport doesn't exist yet in this earlier slice and
+/// Organization/Person verification is a coarser, earlier-stage concept.
+enum VerificationStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+}
+
+/// Generic lifecycle status used as the base-audit "status" column (p.12)
+/// for entities whose own domain status is a *different axis* than
+/// record-level soft deletion (e.g. Organization.verificationStatus tracks
+/// "is this org KYB-verified", independent of "is this record retired").
+/// Entities with a domain status that already IS a lifecycle status
+/// (OrganizationMembership.status) use that field directly instead of
+/// duplicating a second, redundant status column — see schema comments on
+/// those models.
+enum RecordStatus {
+  ACTIVE
+  RETIRED
+}
+
+/// Base-audit "source_type" column (p.12). PLATFORM = created directly
+/// through this platform's own UI/API. IMPORT/CONNECTOR/MIGRATION are
+/// named here for forward-compatibility with packages/connectors (p.25,
+/// not built yet) and are unused by earlier seed/application code, which
+/// only ever writes PLATFORM.
+enum SourceType {
+  PLATFORM
+  IMPORT
+  CONNECTOR
+  MIGRATION
+  SYSTEM
+}
+
+// =================================================================
+// Core tenancy models
+// =================================================================
+
+/// the spec: "legalName, displayName, entityType, country,
+/// registrationId, website, verificationStatus"
+model Organization {
+  id                 String             @id @db.Uuid
+  legalName          String             @map("legal_name")
+  displayName        String             @map("display_name")
+  entityType         OrganizationType   @map("entity_type")
+  /// ISO 3166-1 alpha-2, e.g. "US", "GB".
+  country            String             @db.Char(2)
+  registrationId     String?            @map("registration_id")
+  website            String?
+  verificationStatus VerificationStatus @default(UNVERIFIED) @map("verification_status")
+
+  // ---- base audit columns (the spec, verbatim column list) ----
+  // created_by_user_id / created_by_org_id / updated_by_user_id are
+  // intentionally soft references (plain uuid columns, no enforced FK) —
+  // see "Soft-reference audit columns" note in README.md. Enforcing FKs
+  // here would require Prisma named relations on every base-audited model
+  // pointing back at User/Organization and would block legitimate
+  // retention/deletion of the *actor* while keeping the historical record,
+  // which is the opposite of what p.12's own soft-deletion policy wants
+  // ("hard delete only under retention/privacy policy").
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(MEMBER_MARKET) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  memberships OrganizationMembership[]
+  people      Person[]
+
+  // ---- earlier additions (RFQ + Deal Room, see schema section below) ----
+  opportunitiesOwned     Opportunity[]
+  capacityProfiles       CapacityProfile[]
+  rfqRecipients          RFQRecipient[]
+  quotes                 Quote[]
+  dealRoomsAsMerchant    DealRoom[]            @relation("DealRoomMerchant")
+  dealRoomsAsProvider    DealRoom[]            @relation("DealRoomProvider")
+  dealRoomParticipations DealRoomParticipant[]
+  dealConditionsOwed     DealCondition[]
+
+  // ---- earlier additions (Lockbox, see schema section below) ----
+  lockboxesSealed         Lockbox[]                @relation("LockboxSealer")
+  lockboxesReceived       Lockbox[]                @relation("LockboxRecipient")
+  lockboxReleasesReceived LockboxReleaseEvidence[] @relation("LockboxReleaseRecipient")
+
+  // ---- earlier additions (Attribution, see schema section below) ----
+  claimsAsClaimant         Claim[]        @relation("ClaimClaimant")
+  claimsAsSubject          Claim[]        @relation("ClaimSubject")
+  claimDisputesChallenged  ClaimDispute[] @relation("ClaimDisputeChallenger")
+
+  // ---- earlier addition (Passport, see schema section below) ----
+  passport Passport?
+
+  // ---- earlier additions (Economics, see schema section below) ----
+  commissionComponentsAsRecipient CommissionComponent[] @relation("CommissionComponentRecipient")
+  commissionAccrualsAsRecipient   CommissionAccrual[]   @relation("CommissionAccrualRecipient")
+  commissionPaymentsAsRecipient   CommissionPayment[]   @relation("CommissionPaymentRecipient")
+
+  @@map("organizations")
+}
+
+/// the spec: "name, title, organizationId, contactChannels,
+/// verificationStatus, sensitivity". A Person is a business contact at an
+/// Organization; not every Person has platform login access (userId is
+/// nullable — links to a User only when this contact is also a platform
+/// user).
+model Person {
+  id                 String             @id @db.Uuid
+  name               String
+  title              String?
+  organizationId     String             @map("organization_id") @db.Uuid
+  organization       Organization       @relation(fields: [organizationId], references: [id])
+  /// Array of {type, value} contact channel objects (email/phone/etc.) —
+  /// kept as Json for earlier rather than a separate table since the scope
+  /// doesn't decompose contact channels further on p.13.
+  contactChannels    Json               @default("[]") @map("contact_channels")
+  verificationStatus VerificationStatus @default(UNVERIFIED) @map("verification_status")
+  /// p.13 names "sensitivity" without defining its values. Reusing the
+  /// canonical DisclosureClass (D5) is the defensible choice: a contact's
+  /// visibility tier is conceptually the same six-value disclosure ladder
+  /// applied elsewhere, not a bespoke enum.
+  sensitivity        DisclosureClass    @default(MEMBER_MARKET)
+  userId             String?            @unique @map("user_id") @db.Uuid
+  user               User?              @relation(fields: [userId], references: [id])
+
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(MEMBER_MARKET) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([organizationId])
+  @@map("people")
+}
+
+/// The platform login identity. Not explicitly given a field list on
+/// p.13 (p.13 lists Organization/Person/OrganizationMembership/etc, and
+/// OrganizationMembership references "userId" without a separate User
+/// entity block) — this is the natural, minimal identity table those
+/// references imply: email + credential + status. the spec auth
+/// requirements (magic-link, Google OAuth, MFA for operator/admin,
+/// session cookies) all attach to this entity.
+model User {
+  id           String     @id @db.Uuid
+  email        String     @unique
+  /// bcrypt hash. earlier auth is email+password against seeded users (see
+  /// ADR-0007) — magic-link/OAuth are explicitly deferred, not
+  /// silently dropped.
+  passwordHash String     @map("password_hash")
+  /// Serves as both the domain lifecycle state (active/suspended/invited)
+  /// AND the base-audit "status" column (p.12) — same dual-duty pattern
+  /// as OrganizationMembership.status, applied here because UserStatus
+  /// already covers "is this account usable" and a second, differently-
+  /// named generic status column would just be a confusing duplicate of
+  /// the same axis. retiredAt below is the independent hard-retirement
+  /// marker the base-audit convention pairs with status.
+  status       UserStatus @default(ACTIVE)
+  /// the spec: "MFA required for operator/admin". earlier stores the flag
+  /// and the authz layer can require it be true for operator-tier roles;
+  /// the actual MFA challenge/enrollment flow is not built this pass —
+  /// tracked as an open item, not silently claimed done.
+  mfaEnabled   Boolean    @default(false) @map("mfa_enabled")
+  lastLoginAt  DateTime?  @map("last_login_at")
+
+  createdAt       DateTime        @default(now()) @map("created_at")
+  /// Nullable even on User itself — first-user/seed bootstrap has no
+  /// prior actor to attribute creation to.
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  person      Person?
+  memberships OrganizationMembership[]
+  sessions    Session[]
+
+  @@map("users")
+}
+
+/// the spec (verbatim): "Every user belongs to one or more
+/// OrganizationMembership records with role, status, invitation source
+/// and effective dates." the spec: "organizationId, userId, role,
+/// status, effective dates". This IS the tenant-isolation join table —
+/// packages/authz's can() resolves tenant boundary membership through
+/// this model, and the P4 proof (see the test evidence) exercises it
+/// directly.
+model OrganizationMembership {
+  id               String           @id @db.Uuid
+  organizationId   String           @map("organization_id") @db.Uuid
+  organization     Organization     @relation(fields: [organizationId], references: [id])
+  userId           String           @map("user_id") @db.Uuid
+  user             User             @relation(fields: [userId], references: [id])
+  role             PersonaRole
+  /// This status field serves double duty as both the domain state
+  /// (invited/active/suspended/revoked) AND the base-audit "status"
+  /// column (p.12) — see the RecordStatus enum comment for why that's
+  /// not duplicative here (REVOKED plays the "retired" role for a
+  /// membership; retiredAt is still populated independently when that
+  /// happens).
+  status           MembershipStatus @default(INVITED)
+  invitationSource String?          @map("invitation_source")
+
+  // These ARE the base-audit effective_from/effective_to columns —
+  // membership's own "effective dates" (p.4) and the generic base-audit
+  // pair are the same concept for this entity, so there is one field
+  // pair, not two.
+  effectiveFrom DateTime  @default(now()) @map("effective_from")
+  effectiveTo   DateTime? @map("effective_to")
+  retiredAt     DateTime? @map("retired_at")
+
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+
+  sessions Session[]
+
+  // A user can hold more than one role at the same org over time (e.g.
+  // promoted from CONTRIBUTOR_AGENT to MARKETPLACE_OPERATOR) — uniqueness
+  // is per (org, user, role) rather than per (org, user), so history is
+  // never overwritten; status/effectiveTo/retiredAt close out old rows.
+  @@unique([organizationId, userId, role])
+  @@index([userId])
+  @@index([organizationId])
+  @@map("organization_memberships")
+}
+
+// =================================================================
+// Auth support models
+// =================================================================
+
+/// DB-backed, revocable session. The cookie holds a random opaque token;
+/// only this table's tokenHash (sha256 of that token) is ever persisted,
+/// so a DB read alone can never yield a usable session token (the spec:
+/// "Session cookies are HttpOnly, Secure, SameSite appropriate").
+model Session {
+  id     String @id @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id])
+
+  tokenHash String @unique @map("token_hash")
+
+  /// Which OrganizationMembership this session is currently "acting as".
+  /// Every tenant-scoped request resolves its org context through this
+  /// field, never through a client-supplied org id — that's the crux of
+  /// the P4 tenant-isolation proof.
+  activeMembershipId String?                 @map("active_membership_id") @db.Uuid
+  activeMembership   OrganizationMembership? @relation(fields: [activeMembershipId], references: [id])
+
+  createdAt      DateTime  @default(now()) @map("created_at")
+  expiresAt      DateTime  @map("expires_at")
+  revokedAt      DateTime? @map("revoked_at")
+  lastSeenAt     DateTime? @map("last_seen_at")
+  ipClass        String?   @map("ip_class")
+  userAgentClass String?   @map("user_agent_class")
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// =================================================================
+// Audit base
+// =================================================================
+
+/// Generic, append-only audit log (earlier "audit base" block). Distinct
+/// from DomainEvent (p.12: "Domain events are append-only facts; audit
+/// events capture who viewed or changed restricted values") —
+/// packages/events/DomainEvent is earlier+ scope and is NOT built this
+/// pass. Only `create` is exposed by AuditRepository; there is no
+/// update/delete path anywhere in the application layer.
+model AuditEvent {
+  id         String   @id @db.Uuid
+  occurredAt DateTime @default(now()) @map("occurred_at")
+
+  actorUserId String?      @map("actor_user_id") @db.Uuid
+  actorOrgId  String?      @map("actor_org_id") @db.Uuid
+  actorRole   PersonaRole? @map("actor_role")
+
+  /// The org whose data was viewed/changed — distinct from actorOrgId
+  /// (an operator's own org differs from the org whose restricted field
+  /// they viewed). Tenant-scoped audit queries filter on this column.
+  subjectOrgId String? @map("subject_org_id") @db.Uuid
+
+  action       String
+  resourceType String  @map("resource_type")
+  resourceId   String? @map("resource_id")
+
+  /// Safe references only — never secret payload content (the spec:
+  /// "Event payloads store safe references; secret payload content is not
+  /// copied into general logs").
+  beforeValue Json? @map("before_value")
+  afterValue  Json? @map("after_value")
+
+  requestId      String? @map("request_id")
+  correlationId  String? @map("correlation_id")
+  ipClass        String? @map("ip_class")
+  userAgentClass String? @map("user_agent_class")
+  /// Populated for manual overrides — the spec AUTHORITY INVARIANT: "A
+  /// manual override changes a decision state only when actor, reason,
+  /// prior value, new value, scope, expiration and approval status are
+  /// persisted."
+  reason         String?
+  metadata       Json?
+
+  @@index([subjectOrgId, occurredAt])
+  @@index([actorUserId, occurredAt])
+  @@index([resourceType, resourceId])
+  @@map("audit_events")
+}
+
+/// Backs apps/api's Idempotency-Key support (the spec: "All mutation
+/// endpoints support Idempotency-Key when duplicate network retries could
+/// create a second record or transition").
+model IdempotencyKey {
+  id             String   @id @db.Uuid
+  /// Client-supplied Idempotency-Key header value.
+  key            String
+  /// Namespaces keys per endpoint/use-case so two different mutation
+  /// types can't collide on the same client-chosen key string.
+  scope          String
+  /// sha256 of method+path+body — lets a repeat request with the SAME key
+  /// but a DIFFERENT body be rejected as a client error instead of
+  /// silently replaying the wrong cached response.
+  requestHash    String   @map("request_hash")
+  responseStatus Int?     @map("response_status")
+  responseBody   Json?    @map("response_body")
+  organizationId String?  @map("organization_id") @db.Uuid
+  userId         String?  @map("user_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at")
+  expiresAt      DateTime @map("expires_at")
+
+  @@unique([scope, key])
+  @@map("idempotency_keys")
+}
+
+// =================================================================
+// earlier: P13 RFQ + P14 Deal Room
+//
+// Grounded in tol_scope.txt (re-extracted cleanly this pass via
+// python-docx — see the build log's earlier changelog entry):
+//   p.5   — Opportunity/RFQ/DealRoom state machines (verbatim, ported
+//           into @tol/domain's transition tables — see that package)
+//   p.12  — money = integer minor units + ISO currency, NEVER floating
+//           point; basis points = integer bps; base audit columns
+//   p.15  — Opportunity / VolumeSummary / Movability key fields
+//   p.16  — CapacityProfile key fields + freshness classes
+//   p.21  — RFQ / RFQRecipient / RFQQuestion / Quote / QuoteRate /
+//           ReserveTerm / SettlementTerm / CapacityOffer / Condition /
+//           QuoteDecision key fields + RFQ rules
+//   p.22  — Deal Room surfaces (Overview/Vault/Questions/Conditions/
+//           Decisions/Timeline/Activation/Outcome) + disclosure tiers
+//           (MATCH_SUMMARY/QUALIFIED_RFQ/DUE_DILIGENCE/RESTRICTED, D5)
+//   p.26  — representative domain event names (rfq.sent, rfq.acknowledged,
+//           quote.submitted, quote.selected, condition.created,
+//           deal.activated, deal.live) — see packages/events
+//
+// Scope decisions specific to this block are recorded in ADR-0008
+// (not re-derived here) — read that entry for the reasoning behind:
+//   - Opportunity/CapacityProfile kept intentionally thin (P7/P8's full
+//     VolumeSlice/JurisdictionCapability decomposition is a later day)
+//   - QuoteDecision (p.21) folded into Quote.status + DealDecision
+//     rather than a third parallel decision table
+//   - money fields: BigInt for volume/capacity-scale amounts that could
+//     realistically exceed Postgres INT4 range in minor units, plain Int
+//     for bounded per-transaction/per-quote amounts and all bps fields
+//   - DomainEvent follows AuditEvent's earlier precedent (a lean,
+//     purpose-built shape, NOT the full base-audit-column set) because
+//     it is the same "append-only infra log" category as AuditEvent, not
+//     a governed business entity — every OTHER model in this section IS
+//     a governed business entity and DOES carry the full base-audit set.
+// =================================================================
+
+/// p.15 names Opportunity's "opportunityType" field without enumerating
+/// values anywhere in the 33 pages — inferred from the prototype's
+/// MerchantProfile.seekingRoutes union (the prototype's `model.ts`,
+/// reuse-reference only) and p.15's own "Merchant/PSP role questions"
+/// framing. Flagged as inference, same discipline as the
+/// OrganizationType.
+enum OpportunityType {
+  ACQUIRING
+  PSP_ROUTING
+  BACKUP_PROCESSING
+}
+
+/// the spec verbatim (Object || States table): "Opportunity || DRAFT →
+/// READINESS_BLOCKED → MATCH_READY → INVITED → QUOTED → SELECTED →
+/// ACTIVATING → LIVE → CLOSED". Transition legality lives in
+/// @tol/domain's opportunity-states.ts, not here — schema.prisma only
+/// declares the value set; enforcing the graph is a domain-service job
+/// (p.5 STATE RULE: "never arbitrary UI field edits").
+enum OpportunityStatus {
+  DRAFT
+  READINESS_BLOCKED
+  MATCH_READY
+  INVITED
+  QUOTED
+  SELECTED
+  ACTIVATING
+  LIVE
+  CLOSED
+}
+
+/// the spec verbatim ("Freshness classes"): "FRESH — provider-confirmed
+/// inside configured window. AGING — still usable but ranking penalty
+/// applies... STALE — cannot be auto-invited... UNKNOWN — discovery lead
+/// only; not counted as active marketplace capacity."
+enum FreshnessClass {
+  FRESH
+  AGING
+  STALE
+  UNKNOWN
+}
+
+/// the spec verbatim: "RFQ || DRAFT → SENT → ACKNOWLEDGED → QUESTIONS →
+/// QUOTED → EXPIRED/DECLINED/SELECTED".
+enum RfqStatus {
+  DRAFT
+  SENT
+  ACKNOWLEDGED
+  QUESTIONS
+  QUOTED
+  EXPIRED
+  DECLINED
+  SELECTED
+}
+
+/// Inferred (p.21 names the RFQRecipient.state field without enumerating
+/// values) — see @tol/domain/src/rfq-states.ts's file header for the full
+/// reasoning. ACKNOWLEDGED is modeled for completeness/forward-compat;
+/// an earlier API never reaches it (see that file's comment).
+enum RfqRecipientState {
+  INVITED
+  ACKNOWLEDGED
+  DECLINED
+  QUOTED
+  EXPIRED
+}
+
+/// Inferred (p.21 names Quote.status without enumerating values) — upgrades
+/// the prototype's lowercase draft/issued/accepted/expired
+/// (the prototype's `model.ts`, reuse-reference only) with REJECTED
+/// (p.21's QuoteDecision names "selected/rejected" as the two outcomes)
+/// and WITHDRAWN (this build's own explicit "submit/withdraw quote"
+/// instruction). See @tol/domain/src/rfq-states.ts.
+enum QuoteStatus {
+  SUBMITTED
+  SELECTED
+  REJECTED
+  EXPIRED
+  WITHDRAWN
+}
+
+/// the spec's Deal Room disclosure-tiers table, mapped onto the D5
+/// canonical DisclosureClass per ADR-0005's own mapping table:
+/// MATCH_SUMMARY is a direct match; QUALIFIED_RFQ is a named packet type
+/// SCOPED WITHIN DEAL_ROOM; DUE_DILIGENCE is a named packet type scoped
+/// within RESTRICTED; p.22's own RESTRICTED is a direct match. This enum
+/// is DIFFERENT from DisclosureClass — it is RFQVersion's own
+/// "packetType" field (what KIND of packet this version is), not a
+/// second, competing privacy-class ladder.
+enum DisclosurePacketType {
+  MATCH_SUMMARY
+  QUALIFIED_RFQ
+  DUE_DILIGENCE
+  RESTRICTED
+}
+
+/// the spec verbatim: "DealRoom || OPEN → CONDITIONS →
+/// APPROVED/DECLINED → ACTIVATION → LIVE → ARCHIVED". an earlier API
+/// only drives OPEN..APPROVED/DECLINED — see @tol/domain/src/
+/// deal-states.ts's file header for why ACTIVATION/LIVE/ARCHIVED are
+/// modeled but not reachable through an earlier routes.
+enum DealRoomStatus {
+  OPEN
+  CONDITIONS
+  APPROVED
+  DECLINED
+  ACTIVATION
+  LIVE
+  ARCHIVED
+}
+
+/// Inferred — p.22 names DealRoomParticipant conceptually (deal room
+/// "counterparties") without an explicit enum. OPERATOR is modeled for
+/// completeness (an assigned operator IS a legitimate participant
+/// concept per p.4's Marketplace Operator persona) but an earlier code
+/// never inserts an OPERATOR row — see ADR-0008.
+enum DealParticipantRole {
+  MERCHANT
+  PROVIDER
+  OPERATOR
+}
+
+/// Inferred (p.21/p.22 name Condition/DealCondition's "state" field
+/// without enumerating values; "blocking" is a SEPARATE boolean field on
+/// the same object per p.21's own listing, not folded into this enum).
+enum DealConditionState {
+  PENDING
+  SATISFIED
+  WAIVED
+  REJECTED
+}
+
+/// the spec verbatim: "Decisions: quote selection, approvals, declines,
+/// exceptions and rationale."
+enum DealDecisionType {
+  QUOTE_SELECTED
+  APPROVAL
+  DECLINE
+  EXCEPTION
+}
+
+/// the spec: "Opportunity || ownerOrg, opportunityType, status,
+/// requestedService, readiness" + VolumeSummary ("totalPaymentVolume,
+/// totalCardGPV, eligibleCardGPV, offeredCardGPV") + Movability
+/// ("movableNow, movable30d, movable90d"). Deliberately thin relative to
+/// p.15's full object list (Movability.newIncrementalExpected,
+/// VolumeSlice's jurisdiction x MCC breakdown, RiskSnapshot,
+/// SettlementRequirement, TechnicalRequirement, and the "Mandatory
+/// reconciliation" engine are P7 scope — see ADR-0008) — this
+/// table exists so P13 RFQ has a real Opportunity to attach to.
+model Opportunity {
+  id               String          @id @db.Uuid
+  ownerOrgId       String          @map("owner_org_id") @db.Uuid
+  ownerOrg         Organization    @relation(fields: [ownerOrgId], references: [id])
+  opportunityType  OpportunityType @map("opportunity_type")
+  requestedService String          @map("requested_service")
+
+  /// Dual-duty with the base-audit "status" column (same pattern as
+  /// the OrganizationMembership.status/User.status — see those
+  /// models' comments) — CLOSED plays the "retired" role; a second,
+  /// separate RecordStatus column would just duplicate this axis.
+  status OpportunityStatus @default(DRAFT)
+
+  /// p.12: "Volume || money + period + denominator/type; never naked
+  /// '$30M'" — every amount below carries an explicit currency and is a
+  /// GPV/volume-scale figure, stored as BigInt minor units (see this
+  /// section's header note on the Int-vs-BigInt money split).
+  currency                String @db.Char(3)
+  totalPaymentVolumeMinor BigInt @default(0) @map("total_payment_volume_minor")
+  totalCardGpvMinor       BigInt @default(0) @map("total_card_gpv_minor")
+  eligibleCardGpvMinor    BigInt @default(0) @map("eligible_card_gpv_minor")
+  offeredCardGpvMinor     BigInt @default(0) @map("offered_card_gpv_minor")
+  movableNowMinor         BigInt @default(0) @map("movable_now_minor")
+  movable30dMinor         BigInt @default(0) @map("movable_30d_minor")
+  movable90dMinor         BigInt @default(0) @map("movable_90d_minor")
+
+  /// p.15's Opportunity doesn't itself carry jurisdictions/MCCs directly
+  /// (those live on the VolumeSlice breakdown, P7 scope) — earlier stores a
+  /// flat summary list on the Opportunity header so RFQ/matching-adjacent
+  /// UI has something real to render without needing VolumeSlice. Each
+  /// array holds plain ISO country / MCC code strings; validated with
+  /// @tol/contracts' OpportunityRequestSchema before it ever reaches this
+  /// column, same discipline as the Person.contactChannels.
+  jurisdictions Json @default("[]")
+  mccs          Json @default("[]")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(MEMBER_MARKET) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  rfqs      RFQ[]
+  dealRooms DealRoom[]
+  // ---- earlier addition (Attribution, see schema section below) ----
+  claims    Claim[]
+  // ---- earlier addition (P7 volume reconciliation, see schema section below) ----
+  volumeSlices VolumeSlice[]
+  // ---- earlier addition (Matching, see schema section below) ----
+  matchResults MatchResult[]
+
+  @@index([ownerOrgId])
+  @@index([status])
+  @@map("opportunities")
+}
+
+/// the spec: "CapacityProfile || providerOrgId, status, asOf, source,
+/// freshnessClass" + JurisdictionCapability/ProductCapability/VolumeLimit/
+/// RiskAppetite/SettlementCapability/TechnicalCapability/
+/// CommercialTermTemplate key fields, folded into structured Json fields
+/// (validated at the contracts layer) rather than 7 separate normalized
+/// child tables — see ADR-0008 for why (same "thin but real"
+/// scoping call as Opportunity, above).
+model CapacityProfile {
+  id                 String         @id @db.Uuid
+  providerOrgId      String         @map("provider_org_id") @db.Uuid
+  providerOrg        Organization   @relation(fields: [providerOrgId], references: [id])
+  asOf               DateTime       @map("as_of")
+  freshnessClass     FreshnessClass @default(UNKNOWN) @map("freshness_class")
+  acceptingNewVolume Boolean        @default(true) @map("accepting_new_volume")
+
+  jurisdictions Json @default("[]")
+  mccsAccepted  Json @default("[]") @map("mccs_accepted")
+  mccsExcluded  Json @default("[]") @map("mccs_excluded")
+
+  currency             String @db.Char(3)
+  /// Monthly capacity is a volume-scale figure (BigInt, see header note);
+  /// ticket bounds are per-transaction (Int is ample headroom).
+  monthlyCapacityMinor BigInt @default(0) @map("monthly_capacity_minor")
+  minTicketMinor       Int    @default(0) @map("min_ticket_minor")
+  maxTicketMinor       Int    @default(0) @map("max_ticket_minor")
+
+  /// p.16 RiskAppetite ("CB/fraud/refund limits") as integer bps ceilings.
+  maxChargebackBps Int @default(0) @map("max_chargeback_bps")
+  maxFraudBps      Int @default(0) @map("max_fraud_bps")
+  maxRefundBps     Int @default(0) @map("max_refund_bps")
+
+  /// p.16 SettlementCapability, kept to the three scalar fields the
+  /// UI/RFQ actually reference; full multi-currency/multi-rail breakdown
+  /// deferred with the rest of P8's richness.
+  settlementRail        String @map("settlement_rail")
+  settlementCadenceDays Int    @default(1) @map("settlement_cadence_days")
+
+  /// p.16 CommercialTermTemplate ("MDR/buy rate model, fixed fees,
+  /// reserve, settlement, validity") — structured Json, validated at the
+  /// contracts layer; every amount inside is integer minor units/bps,
+  /// never a float (p.12).
+  commercialTerms Json? @map("commercial_terms")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  // ---- earlier addition (Matching, see schema section near VolumeSlice) ----
+  matchResults MatchResult[]
+
+  @@index([providerOrgId])
+  @@index([freshnessClass])
+  @@map("capacity_profiles")
+}
+
+/// the spec: "RFQ || opportunityId, inviteSet, status, dueAt,
+/// disclosurePacketVersion". "inviteSet" is RFQRecipient (below), not a
+/// column here. `currentVersionNumber` denormalizes RFQVersion's latest
+/// versionNumber for cheap reads (p.21: "Packet changes after send
+/// create a new version").
+model RFQ {
+  id                   String      @id @db.Uuid
+  opportunityId        String      @map("opportunity_id") @db.Uuid
+  opportunity          Opportunity @relation(fields: [opportunityId], references: [id])
+  status               RfqStatus   @default(DRAFT)
+  dueAt                DateTime    @map("due_at")
+  currentVersionNumber Int         @default(1) @map("current_version_number")
+
+  // ---- base audit columns (p.12). ownerOrgId for authz purposes is the
+  // owning Opportunity's ownerOrgId (the merchant/PSP org) — resolved via
+  // the opportunity relation above, not duplicated as a second column,
+  // since it can never legitimately differ from opportunity.ownerOrgId. ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(DEAL_ROOM) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  versions   RFQVersion[]
+  recipients RFQRecipient[]
+  quotes     Quote[]
+  dealRoom   DealRoom?
+
+  @@index([opportunityId])
+  @@index([status])
+  @@map("rfqs")
+}
+
+/// the spec: "Packet changes after send create a new version and
+/// visible change summary" — the VERSIONED DISCLOSURE this repo's P13
+/// gate exit condition names. Each row is an immutable snapshot (p.12
+/// versioning rule: "disclosure packets and quotes are immutable
+/// snapshots").
+model RFQVersion {
+  id            String               @id @db.Uuid
+  rfqId         String               @map("rfq_id") @db.Uuid
+  rfq           RFQ                  @relation(fields: [rfqId], references: [id])
+  versionNumber Int                  @map("version_number")
+  packetType    DisclosurePacketType @default(QUALIFIED_RFQ) @map("packet_type")
+
+  /// Safe references + normalized opportunity fields + selected evidence
+  /// refs only (p.22: "Named entity + normalized opportunity + selected
+  /// evidence") — never secret payload content (p.12's AuditEvent
+  /// discipline applies equally here). Validated by
+  /// @tol/contracts' DisclosureSnapshotSchema before persisting.
+  disclosureSnapshot Json    @map("disclosure_snapshot")
+  /// Required on every version after v1 — enforced in
+  /// apps/api/src/modules/rfqs/service.ts, not at the DB level (a v1
+  /// creation legitimately has no "change" to summarize yet).
+  changeSummary      String? @map("change_summary")
+
+  // ---- base audit columns (p.12). Every RFQVersion row is create-only
+  // in an earlier code paths (a "change" is always a NEW row, never an
+  // in-place edit of a prior version — the whole point of versioning),
+  // but the full column set is still declared per this section's header
+  // rule (RFQVersion is a governed business entity, not an infra-log
+  // table like DomainEvent) — a later day retracting/superseding a
+  // version would use updatedAt/retiredAt rather than needing a schema
+  // change. ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(DEAL_ROOM) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@unique([rfqId, versionNumber])
+  @@map("rfq_versions")
+}
+
+/// the spec: "RFQRecipient || providerOrgId, state, acknowledgedAt,
+/// declineReason" — this IS RFQ's "inviteSet". `ownerOrgId` for authz
+/// purposes is `providerOrgId` (the invited provider owns their own
+/// recipient row) — see apps/api's rfqs service for how a provider's
+/// access to the PARENT RFQ is granted via this row through @tol/authz's
+/// isParticipant mechanism (ADR-0008) rather than RFQ.ownerOrgId.
+model RFQRecipient {
+  id             String            @id @db.Uuid
+  rfqId          String            @map("rfq_id") @db.Uuid
+  rfq            RFQ               @relation(fields: [rfqId], references: [id])
+  providerOrgId  String            @map("provider_org_id") @db.Uuid
+  providerOrg    Organization      @relation(fields: [providerOrgId], references: [id])
+  state          RfqRecipientState @default(INVITED)
+  acknowledgedAt DateTime?         @map("acknowledged_at")
+  declineReason  String?           @map("decline_reason")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(DEAL_ROOM) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  quotes Quote[]
+
+  @@unique([rfqId, providerOrgId])
+  @@index([providerOrgId])
+  @@map("rfq_recipients")
+}
+
+/// the spec: "Quote || provider, version, currency, validity, status,
+/// submittedAt" + QuoteRate/ReserveTerm/SettlementTerm/CapacityOffer
+/// folded into `terms` (structured Json, validated at the contracts
+/// layer — same "thin but real" call as CapacityProfile.commercialTerms,
+/// ADR-0008). Immutable snapshot per version (p.21: "Quote
+/// amendments never overwrite prior versions") — a re-quote is a NEW row
+/// with `quoteVersion` incremented, never an UPDATE to an existing one.
+///
+/// `quoteVersion` (the domain amendment number p.21 names) is a
+/// DIFFERENT field from the base-audit `version` column below (the
+/// generic row-modification counter every governed table carries, p.12)
+/// — the other models never had a competing domain use of the word
+/// "version", so this is the first case of the two meanings
+/// genuinely coexisting on one entity; named apart on purpose rather than
+/// silently colliding.
+model Quote {
+  id             String       @id @db.Uuid
+  rfqId          String       @map("rfq_id") @db.Uuid
+  rfq            RFQ          @relation(fields: [rfqId], references: [id])
+  rfqRecipientId String       @map("rfq_recipient_id") @db.Uuid
+  rfqRecipient   RFQRecipient @relation(fields: [rfqRecipientId], references: [id])
+  providerOrgId  String       @map("provider_org_id") @db.Uuid
+  providerOrg    Organization @relation(fields: [providerOrgId], references: [id])
+
+  quoteVersion Int         @default(1) @map("quote_version")
+  currency     String      @db.Char(3)
+  status       QuoteStatus @default(SUBMITTED)
+  validUntil   DateTime    @map("valid_until")
+  submittedAt  DateTime    @default(now()) @map("submitted_at")
+
+  /// { rate: {basisType, bps?, fixedMinor?, scope, passThrough},
+  ///   reserve: {type, bps?, amountMinor?, durationDays},
+  ///   settlement: {currency, rail, cadenceDays},
+  ///   capacityOffer: {monthlyAmountMinor, rampSchedule, confidenceBps, expiresAt} }
+  /// — every money value inside is integer minor units/bps, validated by
+  /// @tol/contracts' QuoteTermsSchema before this row is ever written.
+  terms Json
+
+  // ---- base audit columns (p.12). ownerOrgId for authz purposes is
+  // providerOrgId above — the submitting provider owns their own quote
+  // until it's selected; the merchant sees it via the parent RFQ's
+  // isParticipant/ownerOrgId path, never a direct Quote.ownerOrgId grant. ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  dealRoom  DealRoom?
+  decisions DealDecision[]
+
+  @@unique([rfqRecipientId, quoteVersion])
+  @@index([rfqId])
+  @@index([providerOrgId])
+  @@map("quotes")
+}
+
+/// the spec: "DealRoom || OPEN → CONDITIONS → APPROVED/DECLINED →
+/// ACTIVATION → LIVE → ARCHIVED". p.22: Overview/Vault/Questions/
+/// Conditions/Decisions/Timeline surfaces. A deal room is inherently
+/// JOINT (merchant + provider) — for @tol/authz purposes `merchantOrgId`
+/// plays the role of `Resource.ownerOrgId` (the standard same-org path,
+/// since the underlying Opportunity is the merchant's), while the
+/// provider's access is granted through the isParticipant mechanism
+/// verified via a DealRoomParticipant row (ADR-0008) — NOT a
+/// second ownerOrgId, which @tol/authz's Resource shape doesn't support.
+model DealRoom {
+  id              String      @id @db.Uuid
+  opportunityId   String      @map("opportunity_id") @db.Uuid
+  opportunity     Opportunity @relation(fields: [opportunityId], references: [id])
+  rfqId           String      @unique @map("rfq_id") @db.Uuid
+  rfq             RFQ         @relation(fields: [rfqId], references: [id])
+  selectedQuoteId String      @unique @map("selected_quote_id") @db.Uuid
+  selectedQuote   Quote       @relation(fields: [selectedQuoteId], references: [id])
+
+  merchantOrgId String       @map("merchant_org_id") @db.Uuid
+  merchantOrg   Organization @relation("DealRoomMerchant", fields: [merchantOrgId], references: [id])
+  providerOrgId String       @map("provider_org_id") @db.Uuid
+  providerOrg   Organization @relation("DealRoomProvider", fields: [providerOrgId], references: [id])
+
+  status     DealRoomStatus @default(OPEN)
+  /// p.22 Overview surface: "next action" — a free-text operator-settable
+  /// field; no separate "stage" column (status already IS the stage).
+  nextAction String?        @map("next_action")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(DEAL_ROOM) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  participants DealRoomParticipant[]
+  conditions   DealCondition[]
+  decisions    DealDecision[]
+
+  // ---- earlier additions (Economics, see schema section below) ----
+  economicSchedules  CommissionSchedule[]
+  revenueEvents      RevenueEvent[]
+  commissionAccruals CommissionAccrual[]
+  commissionPayments CommissionPayment[]
+
+  @@index([merchantOrgId])
+  @@index([providerOrgId])
+  @@index([status])
+  @@map("deal_rooms")
+}
+
+/// p.22's deal-room "counterparties" made concrete. Auto-created (merchant
+/// + provider rows) atomically when a DealRoom opens
+/// (apps/api/src/modules/rfqs/service.ts's selectQuote) — see
+/// DealParticipantRole's comment for why OPERATOR rows are modeled but
+/// never inserted by an earlier code. `ownerOrgId` for authz purposes is
+/// `organizationId` — a participant row is naturally owned by the org it
+/// represents.
+model DealRoomParticipant {
+  id              String              @id @db.Uuid
+  dealRoomId      String              @map("deal_room_id") @db.Uuid
+  dealRoom        DealRoom            @relation(fields: [dealRoomId], references: [id])
+  organizationId  String              @map("organization_id") @db.Uuid
+  organization    Organization        @relation(fields: [organizationId], references: [id])
+  participantRole DealParticipantRole @map("participant_role")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(DEAL_ROOM) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@unique([dealRoomId, organizationId])
+  @@map("deal_room_participants")
+}
+
+/// the spec Condition object ("required evidence/action, owner, dueAt,
+/// state, blocking") + p.22 Conditions surface ("owner, evidence, due
+/// date, blocking state, resolution history"). "resolution history" is
+/// satisfied by the DomainEvent timeline (packages/events +
+/// DomainEvent table below) rather than a second parallel history table
+/// — ADR-0008.
+model DealCondition {
+  id             String             @id @db.Uuid
+  dealRoomId     String             @map("deal_room_id") @db.Uuid
+  dealRoom       DealRoom           @relation(fields: [dealRoomId], references: [id])
+  description    String
+  ownerOrgId     String             @map("owner_org_id") @db.Uuid
+  ownerOrg       Organization       @relation(fields: [ownerOrgId], references: [id])
+  evidenceRef    String?            @map("evidence_ref")
+  dueAt          DateTime?          @map("due_at")
+  state          DealConditionState @default(PENDING)
+  /// p.21: "state, blocking" are two SEPARATE fields on the same object —
+  /// not folded together (see DealConditionState's own enum comment).
+  blocking       Boolean            @default(true)
+  resolutionNote String?            @map("resolution_note")
+
+  // ---- base audit columns (p.12). No separate resolvedAt/resolvedBy —
+  // the base updatedAt/updatedByUserId columns already capture "when/who
+  // last touched this row", which for the single-resolution-pass
+  // conditions IS the resolution event. ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(DEAL_ROOM) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([dealRoomId])
+  @@map("deal_conditions")
+}
+
+/// the spec verbatim: "Decisions: quote selection, approvals, declines,
+/// exceptions and rationale." Append-only (no state/transition table —
+/// see @tol/domain/src/deal-states.ts's comment on DealDecisionType).
+/// `comparisonSnapshot` folds in p.21's QuoteDecision.comparisonSnapshot
+/// per ADR-0008's consolidation. `actorUserId`/`actorOrgId` are
+/// SOFT references (no FK), matching AuditEvent's precedent exactly —
+/// this is attribution metadata ("who decided"), not a structural
+/// business relationship the way DealCondition.ownerOrgId is.
+model DealDecision {
+  id                 String           @id @db.Uuid
+  dealRoomId         String           @map("deal_room_id") @db.Uuid
+  dealRoom           DealRoom         @relation(fields: [dealRoomId], references: [id])
+  decisionType       DealDecisionType @map("decision_type")
+  reason             String
+  relatedQuoteId     String?          @map("related_quote_id") @db.Uuid
+  relatedQuote       Quote?           @relation(fields: [relatedQuoteId], references: [id])
+  comparisonSnapshot Json?            @map("comparison_snapshot")
+  decidedAt          DateTime         @default(now()) @map("decided_at")
+
+  actorUserId String?      @map("actor_user_id") @db.Uuid
+  actorOrgId  String?      @map("actor_org_id") @db.Uuid
+  actorRole   PersonaRole? @map("actor_role")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(DEAL_ROOM) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([dealRoomId])
+  @@map("deal_decisions")
+}
+
+/// packages/events' persisted substrate — the "Timeline" surface p.22
+/// names ("immutable domain events rendered for users"). DELIBERATELY
+/// follows AuditEvent's earlier shape (NOT the full base-audit-column set)
+/// per this section's header note: DomainEvent is infra-log/eventing,
+/// the same category as AuditEvent, not a governed business entity.
+/// Distinct from AuditEvent itself (p.12: "Domain events are append-only
+/// facts; audit events capture who viewed or changed restricted
+/// values") — the rfqs/deals services write BOTH on every
+/// timeline-worthy mutation, for the two different reasons those two
+/// tables exist.
+model DomainEvent {
+  id            String   @id @db.Uuid
+  eventType     String   @map("event_type")
+  aggregateType String   @map("aggregate_type")
+  aggregateId   String   @map("aggregate_id")
+  /// Safe references only, same discipline as AuditEvent.beforeValue/
+  /// afterValue (p.12) — never secret payload content.
+  payload       Json?
+  occurredAt    DateTime @default(now()) @map("occurred_at")
+
+  actorUserId String?      @map("actor_user_id") @db.Uuid
+  actorOrgId  String?      @map("actor_org_id") @db.Uuid
+  actorRole   PersonaRole? @map("actor_role")
+
+  requestId     String? @map("request_id")
+  correlationId String? @map("correlation_id")
+
+  @@index([aggregateType, aggregateId, occurredAt])
+  @@map("domain_events")
+}
+
+// =================================================================
+// earlier: Lockbox (P9) — the security-critical keystone
+//
+// Grounded in tol_scope.txt:
+//   p.5   — Lockbox state machine (verbatim: DRAFT -> SEALED -> COMMITTED
+//           -> FROZEN -> OPENED -> MATCH_ELIGIBLE; WITHDRAWN/DISPUTED side
+//           states — ported into @tol/domain/src/lockbox-states.ts)
+//   p.17  — "Lockbox Cryptography, Receipt & Release Protocol": the
+//           canonical record list this section's models map onto
+//           (LockboxSubmission, EncryptedBlob, KeyEnvelope, LockboxReceipt,
+//           ReleaseCommitment, ReleaseEvent); the commit/reveal batch note
+//           ("entries move to FROZEN and withdrawal is disabled"); TAMPER
+//           EVIDENCE ("every sealed version gets a checksum receipt...
+//           editing creates a new version, the original is never
+//           overwritten")
+//   p.26  — domain event names: lockbox.sealed, lockbox.committed,
+//           lockbox.withdrawn, lockbox.opened
+//   p.27  — LOCKBOX CLAIM TEST (see ADR-0001)
+//
+// The cryptography itself lives entirely in @tol/crypto (earlier-stage work) —
+// this section only PERSISTS what that package produces (ciphertext, IV,
+// auth tag, wrapped shares, receipt, release evidence). No plaintext
+// payload column and no plaintext DEK/share column exists anywhere below
+// — grep-verifiable (acceptance criterion 9). ADR-0009 records the
+// mechanism choices (server-side crypto, Shamir 2-of-3 over dual-KEK,
+// HMAC over Ed25519, KMS-stand-in key sourcing) this schema assumes.
+//
+// LockboxSubmission (p.17) and EncryptedBlob (p.17) are merged into one
+// `Lockbox` row below — this build's model has no submission that exists
+// without its ciphertext (sealing IS the creation event; there is no
+// persisted DRAFT row — see @tol/domain/src/lockbox-states.ts's header
+// comment). LockboxKeyShare/LockboxReceipt/LockboxReleaseEvidence are
+// deliberately LEANER than a governed business entity (no full
+// base-audit-column set) — the same "append-only infrastructure/
+// security-artifact log, not something a human edits/retires" reasoning
+// ADR-0008 part 6 applied to DomainEvent/AuditEvent, extended here.
+// =================================================================
+
+enum LockboxStatus {
+  DRAFT
+  SEALED
+  COMMITTED
+  FROZEN
+  OPENED
+  MATCH_ELIGIBLE
+  WITHDRAWN
+  DISPUTED
+}
+
+/// Inferred — the build spec never enumerates this value set. Ported
+/// from the reuse-reference prototype's LockboxRelationshipType
+/// (the prototype's `model.ts`) — same documented-inference
+/// discipline as rfq-states.ts. Kept byte-identical to
+/// @tol/domain/src/lockbox-states.ts's own copy.
+enum LockboxRelationshipType {
+  ACQUIRER_RELATIONSHIP
+  PROCESSOR_RELATIONSHIP
+  PSP_RELATIONSHIP
+  MERCHANT_RELATIONSHIP
+  BANKING_RELATIONSHIP
+  INFRASTRUCTURE_RELATIONSHIP
+  QUALIFIED_OPPORTUNITY
+}
+
+/// Macro-region for the market-visible aggregate only (deliberately
+/// coarser than the platform's strict Jurisdiction codes) — same
+/// inference source as LockboxRelationshipType above.
+enum LockboxRegion {
+  EU
+  UK
+  US
+  LATAM
+  APAC
+  MENA
+  GLOBAL
+}
+
+/// The 3 threshold-share custodian roles (ADR-0001/ADR-0009). Must stay
+/// byte-identical to @tol/crypto's LOCKBOX_SHARE_ROLES and
+/// @tol/domain's LockboxShareRole — a mismatch across any of the three
+/// copies would be a real bug; each package's own tests guard its copy.
+enum LockboxShareRole {
+  SEALER
+  OPERATOR
+  ESCROW
+}
+
+/// the spec's LockboxSubmission + EncryptedBlob records, merged (see
+/// section header). `sealerOrgId` is `ownerOrgId` for @tol/authz purposes
+/// — the sealer owns their own Lockbox until release discloses it to
+/// `recipientOrgId`. `status` always starts at SEALED (sealing is the one
+/// action that creates this row).
+model Lockbox {
+  id               String                  @id @db.Uuid
+  sealerOrgId      String                  @map("sealer_org_id") @db.Uuid
+  sealerOrg        Organization            @relation("LockboxSealer", fields: [sealerOrgId], references: [id])
+  relationshipType LockboxRelationshipType @map("relationship_type")
+  region           LockboxRegion
+  status           LockboxStatus           @default(SEALED)
+
+  /// Short, non-sensitive, sealer-supplied label — safe for the
+  /// market-visible aggregate (the spec: "before sealing, user sees
+  /// what is public metadata vs encrypted payload"). NEVER derived from
+  /// or containing the encrypted payload's content — enforced at the
+  /// contracts/service layer (apps/api), not by this column's type.
+  metadataSummary String? @map("metadata_summary")
+
+  // ---- envelope (real crypto — @tol/crypto's SealedEnvelope; see
+  // ADR-0009). iv/ciphertext/authTag are the AES-256-GCM output.
+  // ciphertextHash is sha256(ciphertext) hex — the ONLY payload-derived
+  // value ever safe to put in an AuditEvent/DomainEvent/log line
+  // (acceptance criterion 9, grep-verifiable: this table has no
+  // `plaintext`/`payload`/`dek` column anywhere). `aad` records the bytes
+  // used as GCM's additional authenticated data at seal time (this
+  // build's convention: the lockbox's own id, generated app-side via
+  // newId() before this row is created, so it's known in advance) — the
+  // SERVICE layer always independently recomputes the expected AAD from
+  // `id` for decrypt/release rather than trusting this column, so a
+  // tampered `aad` value can never be used to defeat the AAD-binding
+  // property; this column exists for scope-shape fidelity (p.17 names
+  // "aad" as an EncryptedBlob field) and forensic transparency, not as
+  // the security-relevant read path. ----
+  iv             Bytes
+  ciphertext     Bytes
+  authTag        Bytes  @map("auth_tag")
+  aad            Bytes?
+  ciphertextHash String @map("ciphertext_hash")
+
+  sealedAt DateTime @map("sealed_at")
+
+  withdrawnAt       DateTime? @map("withdrawn_at")
+  withdrawnByUserId String?   @map("withdrawn_by_user_id") @db.Uuid
+  withdrawReason    String?   @map("withdraw_reason")
+
+  recipientOrgId String?       @map("recipient_org_id") @db.Uuid
+  recipientOrg   Organization? @relation("LockboxRecipient", fields: [recipientOrgId], references: [id])
+  releasedAt     DateTime?     @map("released_at")
+  /// Free-form reference to the "controlled condition" release requires
+  /// (earlier brief acceptance criterion 7: "a committed match/deal") — a
+  /// required, format-validated (UUID) reference this pass, not deeply
+  /// cross-checked against a live DealRoom/DealCondition row yet (flagged
+  /// in the build log, same "thin but honest" discipline ADR-0008
+  /// part 2 established for Opportunity/CapacityProfile).
+  conditionRef String? @map("condition_ref")
+
+  shares          LockboxKeyShare[]
+  receipts        LockboxReceipt[]
+  releaseEvidence LockboxReleaseEvidence[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  /// SECRET — the most restrictive tier on the canonical D5 ladder. Unlike
+  /// most governed entities, EVERY row here carries security-bearing
+  /// columns (ciphertext/iv/authTag), not just some fields — the
+  /// market-visible aggregate (existence/type/region/status only) is
+  /// served through a dedicated, narrowly-projected read path, never by
+  /// relaxing this column.
+  privacyClass    DisclosureClass @default(SECRET) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([sealerOrgId])
+  @@index([status])
+  @@map("lockboxes")
+}
+
+/// the spec's KeyEnvelope record, one row per threshold share
+/// (`custodyMode` = "Shamir 2-of-3, see ADR-0009", implicit in
+/// `threshold`/`totalShares` below rather than a separate free-text
+/// column; `wrappedKeyRef` = this row itself). `wrappedShare`/`shareIv`/
+/// `shareAuthTag` are @tol/crypto's WrappedShare — the share's y-values,
+/// AES-256-GCM-encrypted under this role's own KEK (never the raw Shamir
+/// share in any column, per acceptance criteria 2 and 9).
+///
+/// Withdraw (acceptance criterion 6) NULLS OUT the wrapped-share bytes and
+/// sets `destroyedAt`/`destroyedReason` rather than deleting the row
+/// outright — a permanent, auditable record that a share EXISTED and was
+/// DESTROYED, not just a gap where a row used to be. Once nulled, no
+/// query path can reconstruct the DEK for this lockbox even in
+/// combination with the other 2 (now also-nulled) shares — release is
+/// cryptographically, not just permission-check, impossible afterward.
+model LockboxKeyShare {
+  id           String           @id @db.Uuid
+  lockboxId    String           @map("lockbox_id") @db.Uuid
+  lockbox      Lockbox          @relation(fields: [lockboxId], references: [id])
+  holderRole   LockboxShareRole @map("holder_role")
+  shareIndex   Int              @map("share_index")
+  threshold    Int
+  totalShares  Int              @map("total_shares")
+  wrappedShare Bytes?           @map("wrapped_share")
+  shareIv      Bytes?           @map("share_iv")
+  shareAuthTag Bytes?           @map("share_auth_tag")
+  keyVersion   Int              @default(1) @map("key_version")
+
+  createdAt       DateTime  @default(now()) @map("created_at")
+  destroyedAt     DateTime? @map("destroyed_at")
+  destroyedReason String?   @map("destroyed_reason")
+
+  @@unique([lockboxId, holderRole])
+  @@index([lockboxId])
+  @@map("lockbox_key_shares")
+}
+
+/// the spec's LockboxReceipt record verbatim field list (submissionId,
+/// version, ciphertextHash, submittedAt, signer) — `signature`/
+/// `algorithm` added for the REAL signed receipt (earlier brief acceptance
+/// criterion 5) the scope's field list doesn't separately name but the
+/// same page's "TAMPER EVIDENCE" callout requires. Append-only.
+model LockboxReceipt {
+  id             String   @id @db.Uuid
+  lockboxId      String   @map("lockbox_id") @db.Uuid
+  lockbox        Lockbox  @relation(fields: [lockboxId], references: [id])
+  version        Int      @default(1)
+  ciphertextHash String   @map("ciphertext_hash")
+  sealerOrgId    String   @map("sealer_org_id") @db.Uuid
+  sealedAt       DateTime @map("sealed_at")
+  signature      String
+  algorithm      String   @default("HMAC-SHA256")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([lockboxId])
+  @@map("lockbox_receipts")
+}
+
+/// the spec's ReleaseEvent record (submissionId, openedAt, authorizedBy,
+/// keyVersion, packetVersion) — `authorizedRoles`/`conditionRef`/
+/// `ciphertextHash` added so this row alone is a complete, independently
+/// checkable release-evidence record (earlier brief acceptance criterion 7:
+/// "actor, recipient org, timestamp, condition reference, ciphertext-hash/
+/// receipt chain"). Append-only.
+model LockboxReleaseEvidence {
+  id             String       @id @db.Uuid
+  lockboxId      String       @map("lockbox_id") @db.Uuid
+  lockbox        Lockbox      @relation(fields: [lockboxId], references: [id])
+  recipientOrgId String       @map("recipient_org_id") @db.Uuid
+  recipientOrg   Organization @relation("LockboxReleaseRecipient", fields: [recipientOrgId], references: [id])
+  releasedAt     DateTime     @default(now()) @map("released_at")
+
+  authorizedByUserId String @map("authorized_by_user_id") @db.Uuid
+  /// e.g. ["OPERATOR", "ESCROW"] — which >=2 threshold roles' shares were
+  /// combined for this specific release (ADR-0009). Native Postgres
+  /// text[] via Prisma's String[].
+  authorizedRoles String[] @map("authorized_roles")
+  conditionRef    String   @map("condition_ref")
+  ciphertextHash  String   @map("ciphertext_hash")
+  receiptId       String?  @map("receipt_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([lockboxId])
+  @@map("lockbox_release_evidence")
+}
+
+// =================================================================
+// earlier: Attribution (P10) — Claim scoring + dispute path
+//
+// Grounded in tol_scope.txt:
+//   p.13  — "Organization, Person, Relationship & Claim Schema":
+//           RelationshipClaim/ClaimEvidence/ClaimScope/ClaimDecision/
+//           ClaimDispute key fields (verbatim field lists in each
+//           model's own comment below); Directness/proximity vocabulary
+//           (D5-D0)
+//   p.14  — Evidence provenance vocabulary (SELF_REPORTED/
+//           DOCUMENT_EXTRACTED/API_VERIFIED/COUNTERPARTY_CONFIRMED/
+//           OPERATOR_VERIFIED), reused for ClaimEvidence.verificationState
+//   p.18  — "Relationship Attribution, Scoring & Dispute Resolution":
+//           the four scoring factors (HISTORY 40% / PROXIMITY 30% /
+//           EVIDENCE 20% / TIME 10%, computed by @tol/attribution — see
+//           that package, this stage of this day), the Rules section
+//           (contractual-rights override, shared attribution, provisional
+//           expiry, scope dimensions, least-privilege dispute review,
+//           "rule version/score breakdown/reviewer/reason/effective
+//           date/expiry/appeal status"), and the anti-gaming tests
+//   p.26  — domain event names (not yet extracted into this comment —
+//           see packages/events/src/claim-events.ts, added alongside
+//           apps/api's claims module, this stage)
+//
+// THIN-SLICE DEVIATION FROM SCOPE'S LITERAL SCHEMA (full reasoning:
+// ADR-0010, @tol/domain/src/claim-states.ts's header comment):
+// the spec models a separate `Relationship` entity that a
+// `RelationshipClaim` references via `relationshipId`. This build
+// COLLAPSES Relationship + RelationshipClaim into the one `Claim` model
+// below — `subjectOrgId`/`relationshipType` embed what a Relationship
+// row's own `toOrgId`/`relationshipType` would have held. `ClaimEvidence.
+// evidenceId` (p.13, a pointer to a separate Evidence entity, p.14's
+// Passport/Evidence schema) is similarly not built — Passport has no
+// table yet (the build log's own "what's NOT done" list) — so
+// ClaimEvidence embeds its content directly instead of joining to a
+// not-yet-built Evidence row.
+//
+// Transition legality for ClaimStatus/ClaimDisputeStatus lives in
+// @tol/domain's claim-states.ts, not here (same "never arbitrary field
+// edits" discipline as every other state machine in this schema).
+// =================================================================
+
+/// the spec verbatim (Directness/proximity vocabulary).
+enum DirectnessTier {
+  D5
+  D4
+  D3
+  D2
+  D1
+  D0
+}
+
+/// the spec's "Evidence examples" column, decomposed into a closed type set — documented inference (OTHER as an escape hatch), see @tol/domain/src/claim-states.ts. Kept byte-identical to @tol/attribution's own copy (that package cannot depend on @tol/db — zero runtime dependencies — so it declares its own; synced by each package's own test suite, same LOCKBOX_SHARE_ROLES precedent).
+enum ClaimEvidenceType {
+  CONTRACT
+  COUNTERPARTY_ACKNOWLEDGMENT
+  EMAIL_THREAD
+  CRM_RECORD
+  OTHER
+}
+
+/// the spec "Evidence provenance" vocabulary, reused verbatim minus OUTCOME_LEARNED/INFERRED (platform-derived values, not something a claimant/reviewer submits as evidence for a claim) — see @tol/domain/src/claim-states.ts.
+enum EvidenceVerificationState {
+  SELF_REPORTED
+  DOCUMENT_EXTRACTED
+  API_VERIFIED
+  COUNTERPARTY_CONFIRMED
+  OPERATOR_VERIFIED
+}
+
+/// scope's persona-journey narrative for a relationship claim's lifecycle (FILED -> SCORED -> a reviewer's VERIFIED/PARTIAL/REJECTED decision, or DISPUTED, or EXPIRED/WITHDRAWN) — transition legality lives in @tol/domain/src/claim-states.ts, not here; see that file's header comment for why this build renames the scope narrative's "SEALED or SUBMITTED" pre-decision pair to FILED/SCORED.
+enum ClaimStatus {
+  FILED
+  SCORED
+  VERIFIED
+  PARTIAL
+  DISPUTED
+  REJECTED
+  EXPIRED
+  WITHDRAWN
+}
+
+enum ClaimDisputeStatus {
+  OPEN
+  DECIDED
+}
+
+/// the spec's three-way dispute-resolution framing: the original claim's decision UPHELD, a shared/PARTIAL_ATTRIBUTION outcome ("do not force a false single winner"), or the challenger prevails (REJECTED_ORIGINAL).
+enum ClaimDisputeResolution {
+  UPHELD_ORIGINAL
+  PARTIAL_ATTRIBUTION
+  REJECTED_ORIGINAL
+}
+
+/// Narrower than ClaimStatus — see @tol/domain/src/claim-states.ts's own comment: never DISPUTED (a ClaimDecision always resolves OUT of disputed, or directly out of SCORED, into one of these three — never INTO disputed).
+enum ClaimDecisionOutcome {
+  VERIFIED
+  PARTIAL
+  REJECTED
+}
+
+/// the spec Rules: "...and appeal status." The appeal-FILING workflow itself is not built this pass (documented thin-slice cut, ADR-0010) — the field exists and defaults NONE, ready for a later day's appeal endpoint.
+enum ClaimAppealStatus {
+  NONE
+  PENDING
+  GRANTED
+  DENIED
+}
+
+/// the spec: "RelationshipClaim || relationshipId, claimantOrgId, claimantUserId, scope, state, submittedAt, scoreVersion" — see this section's header comment for the Relationship-collapse deviation. `scoreVersion` (p.13) is `algorithmVersion` below (p.12's own naming for the same "derived output must record its version" concept, used consistently with every other derived-output column in this schema).
+model Claim {
+  id            String       @id @db.Uuid
+  claimantOrgId String       @map("claimant_org_id") @db.Uuid
+  claimantOrg   Organization @relation("ClaimClaimant", fields: [claimantOrgId], references: [id])
+  /// Soft reference (no FK) — attribution metadata ("who specifically filed this"), same precedent as DealDecision.actorUserId; claimantOrgId above is the structural owner (this model's Resource.ownerOrgId for @tol/authz purposes), claimantUserId is not.
+  claimantUserId String @map("claimant_user_id") @db.Uuid
+
+  /// The org whose relationship/introduction is being claimed — this section's header comment explains why this isn't a separate Relationship row's toOrgId.
+  subjectOrgId String       @map("subject_org_id") @db.Uuid
+  subjectOrg   Organization @relation("ClaimSubject", fields: [subjectOrgId], references: [id])
+  /// Free-text this pass — the spec names Relationship.relationshipType without enumerating values (same documented-inference discipline as the OrganizationType) — e.g. "ACQUIRER_INTRODUCTION", "PSP_INTRODUCTION", "EXISTING_RELATIONSHIP".
+  relationshipType String @map("relationship_type")
+  /// PROXIMITY factor input for @tol/attribution's scoreClaim() — the spec's D0-D5 vocabulary.
+  directnessTier   DirectnessTier @map("directness_tier")
+
+  /// the spec: "Scope can be provider x program x geography x product x channel x opportunity." Optional — a claim's scope CAN be tied to one specific Opportunity, but doesn't have to be (a broader program/geography claim has no single Opportunity to point at). Competing claims are grouped for ranking (@tol/attribution's rankClaims) by (subjectOrgId, opportunityId) — see this section's header comment.
+  opportunityId String?      @map("opportunity_id") @db.Uuid
+  opportunity   Opportunity? @relation(fields: [opportunityId], references: [id])
+  /// ClaimScope's remaining dimensions (p.13: "organization/product/geography/channel/opportunity dimensions") not already covered by subjectOrgId/opportunityId above — {geography?, channel?, product?, programId?}. Embedded Json, validated by @tol/contracts' ClaimScopeSchema before persisting — same "thin but real Json" discipline as CapacityProfile.commercialTerms (ADR-0008).
+  claimScope Json @default("{}") @map("claim_scope")
+
+  /// Named `status` (not the spec's literal "state") for consistency with every other TOP-LEVEL aggregate root in this schema (Opportunity/RFQ/Quote/DealRoom/Lockbox all use `status`) — dual-duty as the base-audit status column, same pattern as those models.
+  status ClaimStatus @default(FILED)
+
+  // ---- HISTORY/TIME scoring inputs (raw, reproducible — p.12: "record inputVersion(s)... so historical decisions can be reproduced") ----
+  priorCommercialHistoryMonths Int @default(0) @map("prior_commercial_history_months")
+  submissionLagDays            Int @default(0) @map("submission_lag_days")
+
+  // ---- scoring OUTPUT (embedded, per this day's own build scope) ----
+  /// Full @tol/attribution ClaimScoreBreakdown, JSON-serialized — validated by @tol/contracts' ClaimScoreBreakdownSchema before persisting.
+  scoreBreakdown Json? @map("score_breakdown")
+  /// Denormalized copy of scoreBreakdown.total for cheap sort/rank queries (Postgres indexes a plain column cheaply; indexing into a Json blob would need a functional/GIN index this build doesn't add).
+  scoreTotal Float? @map("score_total")
+  algorithmVersion String? @map("algorithm_version")
+  inputVersions Json @default("[]") @map("input_versions")
+  scoredAt DateTime? @map("scored_at")
+  /// the spec: "Provisional claims expire if the contributor cannot validate the relationship within a configurable window." @tol/domain's isClaimProvisionalExpired reads this — see that function's own comment for why nothing automatically transitions a row on this deadline yet (no apps/worker, same documented gap as the rfq-expiry).
+  provisionalExpiresAt DateTime? @map("provisional_expires_at")
+
+  evidenceItems ClaimEvidence[]
+  decisions     ClaimDecision[]
+  disputes      ClaimDispute[]
+
+  // ---- earlier additions (Economics, see schema section below) ----
+  commissionComponents CommissionComponent[]
+  commissionAccruals   CommissionAccrual[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([claimantOrgId])
+  @@index([subjectOrgId])
+  @@index([opportunityId])
+  @@index([status])
+  @@map("claims")
+}
+
+/// the spec: "ClaimEvidence || claimId, evidenceId, evidenceType, assertedFact, verificationState". `evidenceId` (a pointer to a separate Evidence entity, p.14's Passport/Evidence schema) is not built this pass — see this section's header comment; `evidenceRef` below (naming matches DealCondition.evidenceRef's existing precedent) is a free-text pointer instead of a foreign key.
+model ClaimEvidence {
+  id                String                    @id @db.Uuid
+  claimId           String                    @map("claim_id") @db.Uuid
+  claim             Claim                     @relation(fields: [claimId], references: [id])
+  evidenceType      ClaimEvidenceType         @map("evidence_type")
+  /// Free-text description of what this evidence shows — e.g. "Signed MSA dated 2025-11-02" or "Email thread confirming intro, 2025-09-14".
+  assertedFact      String                    @map("asserted_fact")
+  verificationState EvidenceVerificationState @default(SELF_REPORTED) @map("verification_state")
+  /// e.g. a Lockbox id if the raw underlying content is sealed (the spec), or a free-text pointer to where an operator can find the source document. Never the document/email content itself — same "safe references only" discipline as AuditEvent.beforeValue/afterValue (p.12).
+  evidenceRef String? @map("evidence_ref")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([claimId])
+  @@map("claim_evidence")
+}
+
+/// the spec: "ClaimDecision || claimId, decision, scoreBreakdown, reviewer, reason, effective/expiry". p.18 Rules: "Every resolution records rule version, score breakdown, reviewer, reason, effective date, expiry and appeal status." `effectiveFrom`/`effectiveTo` below ARE this decision's own "effective date"/"expiry" (p.18) — same one-pair-not-two precedent as the OrganizationMembership (see that model's own comment) — not a second, redundant pair.
+model ClaimDecision {
+  id      String @id @db.Uuid
+  claimId String @map("claim_id") @db.Uuid
+  claim   Claim  @relation(fields: [claimId], references: [id])
+  /// Set only when this decision resolves a ClaimDispute (vs. a direct SCORED -> decision with no challenger involved).
+  disputeId String?       @map("dispute_id") @db.Uuid
+  dispute   ClaimDispute? @relation(fields: [disputeId], references: [id])
+
+  decision ClaimDecisionOutcome
+  /// Snapshot of the claim's scoreBreakdown AT DECISION TIME (p.13 names this field explicitly) — deliberately copied, not read live off Claim, so a LATER re-score (a new algorithmVersion) never silently rewrites what THIS decision was actually based on.
+  scoreBreakdown   Json   @map("score_breakdown")
+  algorithmVersion String @map("algorithm_version")
+  /// p.18: "records rule version" — distinct from algorithmVersion (the SCORING math's version): this is the DECISION-POLICY rule set's version (e.g. which anti-gaming/override rules were in force). Fixed literal this pass — no rule-versioning config/UI exists yet, same "fixed placeholder until real config exists" precedent as ADR-0004.
+  ruleVersion String @default("attribution-rules-v1") @map("rule_version")
+
+  /// Soft references (no FK) — attribution metadata ("who decided"), same precedent as DealDecision.actorUserId/actorOrgId, not a structural relation the way claimId is.
+  reviewerUserId String @map("reviewer_user_id") @db.Uuid
+  reviewerOrgId  String @map("reviewer_org_id") @db.Uuid
+  reason         String
+
+  appealStatus ClaimAppealStatus @default(NONE) @map("appeal_status")
+
+  // ---- base audit columns (p.12). effectiveFrom/effectiveTo below ARE this decision's own "effective date"/"expiry" — see this model's header comment. ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime        @default(now()) @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([claimId])
+  @@index([disputeId])
+  @@map("claim_decisions")
+}
+
+/// the spec: "ClaimDispute || claimId, challenger, basis, evidence, state, resolution".
+model ClaimDispute {
+  id              String       @id @db.Uuid
+  claimId         String       @map("claim_id") @db.Uuid
+  claim           Claim        @relation(fields: [claimId], references: [id])
+  challengerOrgId String       @map("challenger_org_id") @db.Uuid
+  challengerOrg   Organization @relation("ClaimDisputeChallenger", fields: [challengerOrgId], references: [id])
+  /// Soft reference (no FK) — attribution metadata ("who specifically filed the dispute"), same precedent as Claim.claimantUserId; challengerOrgId above is the structural owner (this model's Resource.ownerOrgId for @tol/authz purposes).
+  challengerUserId String @map("challenger_user_id") @db.Uuid
+
+  basis String
+  /// p.13's "evidence" field, embedded as Json rather than a join to ClaimEvidence — dispute evidence is presented/reviewed once as part of resolving THIS dispute (lower reuse value than Claim's own scoring-feeding evidence, which the engine re-reads on every re-score); validated by @tol/contracts' ClaimDisputeEvidenceItemSchema, same "thin but real Json" discipline as Quote.terms (ADR-0008).
+  evidence Json @default("[]")
+
+  /// Named `status` (not the spec's literal "state") — consistency call, see Claim.status's own comment.
+  status     ClaimDisputeStatus      @default(OPEN)
+  resolution ClaimDisputeResolution?
+
+  decisions ClaimDecision[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([claimId])
+  @@index([challengerOrgId])
+  @@index([status])
+  /// Serves claimDisputeRepository.findOpenByClaim's exact (claimId, status) query pattern (review).
+  @@index([claimId, status])
+  @@map("claim_disputes")
+}
+
+// =================================================================
+// earlier: P5 Marketplace + P6 Passport + P7 Opportunity (VolumeSlice) +
+// P8 Capacity (freshness classification)
+//
+// Grounded in tol_scope.txt:
+//   p.1   — "Members can see market depth, categories of capacity and
+//           anonymized opportunity inventory. Named contacts, exact
+//           appetite, private rates, underwriting evidence and
+//           contributor economics remain permissioned." (the P5 thesis)
+//   p.5   — Passport state machine (verbatim): DRAFT -> INCOMPLETE ->
+//           READY -> VERIFIED -> STALE -> SUSPENDED
+//   p.12  — base audit columns; "All derived outputs record
+//           inputVersion(s), ruleVersion, algorithmVersion and
+//           computedAt... mandatory for match scores, readiness,
+//           attribution scores..."
+//   p.14  — "TOL Passport, Evidence & Verification Schema": Passport /
+//           PassportSection / Fact / Evidence / EvidenceLink /
+//           Verification / ReadinessResult / DisclosurePolicy /
+//           DisclosureGrant object list + field lists; Evidence
+//           provenance vocabulary (7 values, verbatim)
+//   p.15  — Opportunity/VolumeSummary/Movability/VolumeSlice/
+//           RiskSnapshot key fields; "Mandatory reconciliation":
+//           SUM(volume_by_jurisdiction) = offered_card_gpv,
+//           SUM(volume_by_mcc) = offered_card_gpv,
+//           SUM(volume_by_jurisdiction_mcc) = offered_card_gpv,
+//           movable_now <= movable_30d <= movable_90d <= offered_card_gpv
+//   p.16  — CapacityProfile.freshnessClass + "Freshness classes"
+//           (FRESH/AGING/STALE/UNKNOWN, verbatim) — THE COLUMN ALREADY
+//           EXISTS on CapacityProfile as of earlier (see that model
+//           above); what earlier actually adds is the DETERMINISTIC
+//           CLASSIFIER (packages/evidence) that COMPUTES it, replacing
+//           the client-supplied value — see ADR-0011 for
+//           why "add the enum" was already done and is NOT this day's
+//           actual gap.
+//
+// THIN-SLICE DEVIATIONS FROM SCOPE'S LITERAL SCHEMA (full reasoning in
+// ADR-0011, same "thin but honest" discipline as D8/D9/D10):
+//   - PassportSection is NOT a persisted table. p.14 lists it as "Typed
+//     group of facts || sectionType, completeness, freshness" — both of
+//     its own fields (completeness, freshness) are DERIVED aggregates
+//     over a section's Facts, not independent state, so this build
+//     computes them on read (packages/evidence) from Fact.sectionType
+//     groupings rather than persisting a redundant, driftable summary
+//     row per section.
+//   - EvidenceLink is NOT a persisted join table. p.14 gives it a
+//     many-to-many supports/refutes shape (evidenceId, targetType,
+//     targetId, supports/refutes) — this build collapses it to a single
+//     nullable `Fact.evidenceId` pointer (a fact's PRIMARY supporting
+//     evidence). This loses multi-evidence-per-fact and the
+//     supports/refutes distinction; both are named here as an explicit,
+//     additive extension point, not silently dropped.
+//   - DisclosurePolicy/DisclosureGrant are NOT built as separate tables
+//     this pass. The marketplace/passport field-visibility problem these
+//     two objects exist to solve is instead solved by packages/authz's
+//     ALREADY-BUILT fieldPolicy()/redactFields() mechanism (earlier)
+//     applied to Passport/Opportunity/CapacityProfile's own
+//     `privacyClass` + new per-field DisclosureClass tags — the same
+//     "extend the existing mechanism, don't build a parallel one" call
+//     D8 already made for RFQVersion's disclosure tiers.
+// =================================================================
+
+/// the spec verbatim (Object || States table): "Passport || DRAFT ->
+/// INCOMPLETE -> READY -> VERIFIED -> STALE -> SUSPENDED". Transition
+/// legality lives in @tol/domain/src/passport-states.ts, not here.
+enum PassportStatus {
+  DRAFT
+  INCOMPLETE
+  READY
+  VERIFIED
+  STALE
+  SUSPENDED
+}
+
+/// p.14 does not enumerate PassportSection.sectionType's values —
+/// documented inference, grounded in the scope's own recurring
+/// vocabulary for what a Passport must cover: organization identity
+/// (p.13), relationship/processing history (p.15's VolumeSummary/
+/// RiskSnapshot echo this at the opportunity level; Passport is the
+/// org-level analog), risk metrics (p.15 RiskSnapshot), commercial
+/// terms exposure (p.16), and technical integration (p.15
+/// TechnicalRequirement/p.16 TechnicalCapability). See
+/// @tol/domain/src/passport-states.ts for the full reasoning.
+enum PassportSectionType {
+  IDENTITY
+  RELATIONSHIP_HISTORY
+  PROCESSING_METRICS
+  RISK
+  COMMERCIAL
+  TECHNICAL
+}
+
+/// p.14 "Evidence provenance", verbatim, full 7-value list (unlike
+/// @tol/domain's EvidenceVerificationState for Claims, which deliberately
+/// TRIMS this to 5 — see claim-states.ts's own comment on why
+/// OUTCOME_LEARNED/INFERRED don't apply to a claimant-submitted Claim).
+/// Both apply to a Passport Fact, which legitimately CAN be
+/// platform-derived over time (e.g. a processing-metrics Fact inferred
+/// from completed Deal Room outcomes).
+enum FactProvenance {
+  SELF_REPORTED
+  DOCUMENT_EXTRACTED
+  API_VERIFIED
+  COUNTERPARTY_CONFIRMED
+  OPERATOR_VERIFIED
+  OUTCOME_LEARNED
+  INFERRED
+}
+
+/// p.14: "Evidence || File/API/attestation source" — documented
+/// inference, a closed 3-value set matching that exact phrase.
+enum EvidenceSourceKind {
+  FILE
+  API
+  ATTESTATION
+}
+
+/// the spec: "Passport || Container for institution-level trust state
+/// || organizationId, status, readiness, verification, sharingPolicy."
+/// "institution-level" + the scope's own route `/app/passport/[orgId]`
+/// (p.6 — keyed by ORG id, not passport id) both ground the 1:1
+/// Organization:Passport cardinality below (`organizationId @unique`).
+/// `readiness`/`verification` (p.14's own field names) are NOT columns
+/// here — they are the LATEST ReadinessResult row (readiness) and this
+/// model's own `status` reaching VERIFIED (verification) respectively;
+/// storing them a second time here would just be a driftable cache of
+/// what ReadinessResult/status already say authoritatively.
+/// `sharingPolicy` maps onto this schema's existing `privacyClass` base-
+/// audit column (D5's six-value DisclosureClass ladder already IS a
+/// sharing-policy tier) — not a second, competing field.
+model Passport {
+  id             String         @id @db.Uuid
+  organizationId String         @unique @map("organization_id") @db.Uuid
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  status         PassportStatus @default(DRAFT)
+
+  facts            Fact[]
+  evidence         Evidence[]
+  readinessResults ReadinessResult[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(MEMBER_MARKET) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@map("passports")
+}
+
+/// the spec: "Fact || Atomic asserted value || fieldKey,
+/// normalizedValue, source, verification, effective dates." `source`
+/// (p.14's own field) is this row's base-audit `sourceType` column
+/// (dual-duty, same precedent as User.status/OrganizationMembership.status
+/// reusing a base-audit column rather than duplicating it) — HOW the
+/// fact entered the system. `verification` is the new `FactProvenance`
+/// column below — HOW WELL-VERIFIED it currently is. These are
+/// deliberately different axes: an OPERATOR_VERIFIED fact can still have
+/// sourceType PLATFORM (an operator manually confirmed something a user
+/// typed). "effective dates" = the base-audit effectiveFrom/effectiveTo
+/// pair, same one-pair-not-two precedent as the
+/// OrganizationMembership.
+model Fact {
+  id              String              @id @db.Uuid
+  passportId      String              @map("passport_id") @db.Uuid
+  passport        Passport            @relation(fields: [passportId], references: [id])
+  sectionType     PassportSectionType @map("section_type")
+  fieldKey        String              @map("field_key")
+  /// Free-shaped (a string, number, boolean, or small object depending
+  /// on fieldKey) — same "structured Json, validated at the contracts/
+  /// json-guards layer, not itself enumerated" discipline as
+  /// CapacityProfile.commercialTerms.
+  normalizedValue Json                @map("normalized_value")
+  verification    FactProvenance      @default(SELF_REPORTED)
+  /// This Fact's PRIMARY supporting Evidence row — see this section's
+  /// header note on why this replaces p.14's richer many-to-many
+  /// EvidenceLink for this pass.
+  evidenceId String?   @map("evidence_id") @db.Uuid
+  evidence   Evidence? @relation(fields: [evidenceId], references: [id])
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(MEMBER_MARKET) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  // One current value per (passport, fieldKey) — an update REPLACES this
+  // row in place (version increments) rather than a new fieldKey row per
+  // edit; the underlying Evidence trail is what stays append-only (see
+  // Evidence's own comment below), not the Fact itself.
+  @@unique([passportId, fieldKey])
+  @@index([passportId, sectionType])
+  @@map("facts")
+}
+
+/// the spec: "Evidence || File/API/attestation source || type,
+/// objectRef, checksum, issuer, collectedAt, expiresAt." APPEND-ONLY —
+/// p.14 verbatim: "Replacing a document does not erase the prior
+/// evidence version. Historical decisions must retain the evidence
+/// snapshot they used." — this repo's application layer never UPDATEs an
+/// Evidence row's content; a refreshed document is a NEW row, and any
+/// Fact.evidenceId pointer is repointed at the new row while the old one
+/// remains queryable by passportId for history.
+model Evidence {
+  id          String             @id @db.Uuid
+  passportId  String             @map("passport_id") @db.Uuid
+  passport    Passport           @relation(fields: [passportId], references: [id])
+  type        EvidenceSourceKind
+  /// A pointer to the underlying object (e.g. an object-storage key, an
+  /// external API reference, or a Lockbox id if the raw content is
+  /// itself sealed per p.17) — NEVER the raw document/attestation
+  /// content itself, same "safe references only" discipline as
+  /// AuditEvent.beforeValue/afterValue (p.12).
+  objectRef   String             @map("object_ref")
+  /// sha256 or equivalent — proves this exact evidence version was what
+  /// a historical ReadinessResult/decision actually saw, same tamper-
+  /// evidence role as Lockbox's ciphertextHash.
+  checksum    String?
+  issuer      String?
+  collectedAt DateTime           @map("collected_at")
+  expiresAt   DateTime?          @map("expires_at")
+
+  facts Fact[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([passportId])
+  @@map("evidence")
+}
+
+/// the spec: "ReadinessResult || Rules-based completeness || score,
+/// blockers, warnings, ruleVersion." p.12: "All derived outputs record
+/// inputVersion(s), ruleVersion, algorithmVersion and computedAt... so
+/// historical decisions can be reproduced." APPEND-ONLY, one row per
+/// recompute (same precedent as ClaimDecision snapshotting
+/// scoreBreakdown at decision time, NOT DomainEvent's lean infra-log
+/// shape — a ReadinessResult is a governed, human-referenceable derived
+/// output, not a pure event-log row, so it carries the FULL base-audit
+/// set). Callers read the latest row per passportId (orderBy computedAt
+/// desc) rather than a denormalized "current result" pointer column —
+/// same query-don't-denormalize precedent as Claim/ClaimDecision.
+model ReadinessResult {
+  id               String   @id @db.Uuid
+  passportId       String   @map("passport_id") @db.Uuid
+  passport         Passport @relation(fields: [passportId], references: [id])
+  score            Float
+  /// Each item: {sectionType, fieldKey, message} — a missing/expired
+  /// required Fact that BLOCKS readiness (p.29: "user can see exactly
+  /// what blocks readiness and which evidence will cure it").
+  blockers         Json     @default("[]")
+  /// Same shape as blockers, but non-blocking (e.g. an AGING Fact/
+  /// Evidence, or a SELF_REPORTED-only value never independently
+  /// verified).
+  warnings         Json     @default("[]")
+  ruleVersion      String   @map("rule_version")
+  algorithmVersion String   @map("algorithm_version")
+  inputVersions    Json     @default("[]") @map("input_versions")
+  computedAt       DateTime @map("computed_at")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(MEMBER_MARKET) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([passportId, computedAt])
+  @@map("readiness_results")
+}
+
+/// the spec: "VolumeSlice || jurisdiction, MCC, cardOrigin, channel,
+/// currency, amount, period" — the P7 gate's own decomposition, missing
+/// entirely from the intentionally-thin Opportunity (DECISIONS.md
+/// D8 part 2). Each row is the FINEST-GRAIN cell (one jurisdiction x one
+/// MCC x one channel x one period) — see @tol/domain's new
+/// volume-reconciliation.ts for why the scope's three separate SUM(...)
+/// checks (by jurisdiction, by MCC, by jurisdiction+MCC) collapse to one
+/// grand-total check over this finest-grain set, PLUS a duplicate-cell
+/// guard that is what actually makes that collapse valid.
+model VolumeSlice {
+  id            String      @id @db.Uuid
+  opportunityId String      @map("opportunity_id") @db.Uuid
+  opportunity   Opportunity @relation(fields: [opportunityId], references: [id])
+  /// ISO 3166-1 alpha-2 — same convention as Organization.country.
+  jurisdiction String @db.Char(2)
+  mcc          String
+  /// p.15 names "cardOrigin" without enumerating values — documented
+  /// inference (DOMESTIC/INTERNATIONAL, the standard card-scheme
+  /// distinction this field name implies).
+  cardOrigin String @map("card_origin")
+  /// p.15 names "channel" without enumerating values — documented
+  /// inference (ECOMMERCE/CARD_PRESENT/MOTO — the standard acquiring
+  /// channel taxonomy this field name implies).
+  channel  String
+  currency String @db.Char(3)
+  /// p.12: "Money || integer minor units + ISO currency". BigInt — same
+  /// volume-scale reasoning as Opportunity's own GPV columns (Postgres
+  /// INT4's ~$21.4M ceiling in cents, ADR-0008 part 3).
+  amountMinor BigInt @map("amount_minor")
+  /// p.15/p.12: "Volume || money + period + denominator/type; never
+  /// naked '$30M'" — a period LABEL (e.g. "2026-07"), not a computed
+  /// range; matches the scope's own single-field naming ("period").
+  period String
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  // The duplicate-cell guard this section's header note references —
+  // two slices claiming the SAME (jurisdiction, mcc, cardOrigin, channel,
+  // period) cell would let the SUM reconciliation check silently pass on
+  // double-counted volume.
+  @@unique([opportunityId, jurisdiction, mcc, cardOrigin, channel, period])
+  @@index([opportunityId])
+  @@map("volume_slices")
+}
+
+// =================================================================
+// earlier: Matching (P11 Eligibility + P12 Ranking)
+//
+// Grounded in tol_scope.txt:
+//   p.19 — "Eligibility Engine — Deterministic Hard Filters": the ten
+//          named rule families, evaluateEligibility()'s contract shape
+//          (eligible/blockers/warnings/ruleVersion/inputVersions/
+//          evaluatedAt), computed by @tol/matching (see that package,
+//          this stage of this day)
+//   p.20 — "Ranking & Optimization Engine": the nine-factor weighted
+//          model, and verbatim: "Every MatchResult stores factor
+//          contributions, inputs, weight set and algorithm version."
+//   p.12 — "All derived outputs record inputVersion(s), ruleVersion,
+//          algorithmVersion and computedAt... mandatory for MATCH
+//          SCORES... so historical decisions can be reproduced" — the
+//          scope-mandated reason this build persists MatchResult at all,
+//          rather than treating matching as purely on-demand/ephemeral.
+//
+// NO MatchResult STATE MACHINE (a deliberate, checked omission, not an
+// oversight): p.5's own "Object || States" table names exactly six
+// governed objects with domain state machines (Passport, Opportunity,
+// Lockbox, RelationshipClaim, RFQ, DealRoom) — Match/MatchResult is not
+// among them. This model is APPEND-ONLY, one row per (opportunityId,
+// capacityId) evaluation — same precedent as ReadinessResult (earlier): a
+// governed, human-referenceable derived output, not a pure infra-log
+// row, so it carries the FULL base-audit set, but `status` (RecordStatus)
+// plays only its usual base-audit "is this row retired" role, never a
+// Match-specific lifecycle. Callers read the latest/ranked rows per
+// (opportunityId, evaluatedAt desc) rather than a denormalized "current
+// result" pointer — same query-don't-denormalize precedent as
+// Claim/ClaimDecision/ReadinessResult. See ADR-0012.
+// =================================================================
+
+/// the spec/p.20, verbatim field names where the scope's own
+/// Implementation table names them (`eligible`, `ruleVersion`,
+/// `inputVersions`, `algorithmVersion`). `capacityId` scopes each row to
+/// ONE specific provider capacity evaluated against ONE opportunity — a
+/// full matching pass over N candidate capacities inserts N rows, never
+/// one row with an embedded array of candidates, so a single row is
+/// always independently queryable/orderable by rank without unpacking a
+/// nested structure.
+model MatchResult {
+  id            String          @id @db.Uuid
+  opportunityId String          @map("opportunity_id") @db.Uuid
+  opportunity   Opportunity     @relation(fields: [opportunityId], references: [id])
+  capacityId    String          @map("capacity_id") @db.Uuid
+  capacity      CapacityProfile @relation(fields: [capacityId], references: [id])
+
+  eligible Boolean
+  /// Full RuleResult[] (@tol/matching's own shape) — every one of the
+  /// ten rule families' findings, PASS or not, not just the failures.
+  eligibilityResults Json   @map("eligibility_results")
+  ruleVersion        String @map("rule_version")
+
+  /// NULL when NOT eligible — the spec's own INVARIANT ("eligibility
+  /// runs first"; an ineligible provider is never ranked) is enforced
+  /// STRUCTURALLY by this column (and rank/totalScore/algorithmVersion
+  /// below) being unpopulated for any row where eligible=false, not
+  /// merely by application-layer convention. Shape: @tol/matching's
+  /// MatchRankingBreakdown (nine per-factor contributions + total).
+  rankingBreakdown Json?   @map("ranking_breakdown")
+  rank             Int?
+  totalScore       Float?  @map("total_score")
+  algorithmVersion String? @map("algorithm_version")
+
+  inputVersions Json     @default("[]") @map("input_versions")
+  /// Echoes @tol/matching's own evaluateEligibility() `evaluatedAt` —
+  /// the SAME reference instant is passed to both the eligibility and
+  /// ranking engine calls for one evaluation, so this single column is
+  /// accurate for both halves of the row, never two independently-
+  /// drifting timestamps.
+  evaluatedAt DateTime @map("evaluated_at")
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  /// RESTRICTED, not MATCH_SUMMARY — even though the scope names a
+  /// MATCH_SUMMARY disclosure tier (D5), the RAW stored row's
+  /// `rankingBreakdown.factors[].note` strings embed real commercial
+  /// figures (e.g. "MDR 250bps") sourced from CapacityProfile.
+  /// commercialTerms, which is itself RESTRICTED — this row inherits
+  /// that same sensitivity. A further-redacted MATCH_SUMMARY view for
+  /// lower-privilege viewers is a MAPPER-layer concern (apps/api, Block
+  /// 4/5), same "raw row stays strict, a mapper produces the safe
+  /// subset" precedent as D11's marketplace redaction — not a second
+  /// stored row this pass.
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([opportunityId, evaluatedAt])
+  /// Composite, not a separate (opportunityId, capacityId)-only index —
+  /// adopted after review (review "review-
+  /// migration-seed") suggested it to make listLatestByOpportunity's
+  /// groupBy/_max(evaluatedAt) query and listByPair's history scan both
+  /// properly index-covered. A 2-column (opportunityId, capacityId)
+  /// index would have been strictly redundant once this 3-column one
+  /// exists (any query using it as a leftmost prefix is already served),
+  /// so it was replaced rather than kept alongside.
+  @@index([opportunityId, capacityId, evaluatedAt])
+  @@index([opportunityId, eligible, rank])
+  @@map("match_results")
+}
+
+// =================================================================
+// earlier: Economics (P15 — "Traceable schedule/accrual ledger")
+//
+// Grounded in tol_scope.txt:
+//   p.23 — "Economics, Attribution Ledger & Commission Accounting":
+//          EconomicSchedule/EconomicComponent/RevenueEvent/
+//          CommissionAccrual/CommissionPayment/Adjustment object table
+//          (verbatim field lists in each model's own comment below),
+//          the "Calculation principles" (basis never ambiguous,
+//          received-cash schedules calculate from cash actually
+//          received, versioning on change, contributor-dashboard
+//          privacy), and the "RECONCILIATION" requirement (source
+//          revenue -> deductions -> distributable base -> recipient
+//          components -> paid/owed balance).
+//   p.12  — "Money || integer minor units + ISO currency; never
+//          floating point" and "All derived outputs record
+//          inputVersion(s), ruleVersion, algorithmVersion and
+//          computedAt... so historical decisions can be reproduced."
+//
+// MONEY STAYS BigInt END TO END (schedule cap/floor, RevenueEvent
+// gross/deductions/net, CommissionAccrual/CommissionPayment amounts) —
+// a deliberate EXTENSION of ADR-0008 part 3's Int-vs-BigInt
+// split, not a contradiction of it: every economics money figure is
+// downstream of a potentially volume-scale RevenueEvent (a
+// GROSS_PROCESSING_VOLUME-basis schedule can legitimately see the same
+// GPV figures Opportunity's own BigInt columns carry) via integer bps
+// multiplication, so committing to BigInt uniformly for this whole
+// subsystem avoids ever needing a lossy BigInt-to-Int downcast at an
+// internal boundary. See ADR-0013.
+//
+// CommissionAccrual IS the traceable, append-only LEDGER this gate's
+// exit condition names — see that model's own header comment for why
+// one physical table, not two, carries both "the accrual" and "the
+// ledger entry" concepts. Adjustment (the spec's own named object)
+// folds into CommissionAccrual's `entryType`/`reason`/`approver*`
+// fields rather than a sixth model — same reasoning. A full
+// economics-specific Dispute workflow is a named, NOT-BUILT extension
+// this pass (packages/attribution's existing ClaimDispute is the
+// mechanism a later day would extend) — ADR-0013.
+// =================================================================
+
+/// the spec (verbatim): "A schedule names whether economics apply to
+/// gross processing volume, net platform revenue, received commission,
+/// fixed fee, setup fee or another basis."
+enum CommissionBasis {
+  GROSS_PROCESSING_VOLUME
+  NET_PLATFORM_REVENUE
+  RECEIVED_COMMISSION
+  FIXED_FEE
+  SETUP_FEE
+  OTHER
+}
+
+/// packages/domain's real state machine (economics-states.ts) —
+/// DRAFT -> ACTIVE -> SUPERSEDED, or -> RETIRED from either DRAFT or
+/// ACTIVE. See that file's own transition-table comment.
+enum CommissionScheduleStatus {
+  DRAFT
+  ACTIVE
+  SUPERSEDED
+  RETIRED
+}
+
+enum CommissionRecipientType {
+  CONTRIBUTOR
+  PLATFORM
+  OTHER
+}
+
+/// the spec's EconomicComponent "bps/percent/fixed" collapsed to two
+/// types — see packages/domain/src/economics-states.ts's own comment on
+/// why "percent" doesn't need a third value.
+enum CommissionComponentType {
+  PERCENTAGE_BPS
+  FIXED_AMOUNT
+}
+
+/// packages/domain/src/economics-states.ts's own closed vocabulary —
+/// see that file for the full reasoning on each value.
+enum LedgerEntryType {
+  ACCRUAL
+  ADJUSTMENT
+  PAYMENT
+  REVERSAL
+}
+
+enum LedgerDirection {
+  CREDIT
+  DEBIT
+}
+
+/// the spec: "EconomicSchedule || parties, scope, effective dates,
+/// basis, cap/floor, survival". Scoped to exactly ONE DealRoom (a
+/// broader cross-deal "program" schedule is a named, thin-but-honest cut
+/// — ADR-0013, same discipline as D8's Opportunity/
+/// CapacityProfile thin-slice). `scheduleFamilyId` is shared by every
+/// VERSION of "the same logical schedule" (self-id on the FIRST version,
+/// carried forward on every superseding version) so callers can find
+/// "every version of this schedule" without walking the
+/// `previousVersionId` chain one hop at a time.
+model CommissionSchedule {
+  id               String @id @db.Uuid
+  dealRoomId       String @map("deal_room_id") @db.Uuid
+  dealRoom         DealRoom @relation(fields: [dealRoomId], references: [id])
+  scheduleFamilyId String @map("schedule_family_id") @db.Uuid
+  versionNumber    Int    @default(1) @map("version_number")
+  previousVersionId String?            @map("previous_version_id") @db.Uuid
+  previousVersion   CommissionSchedule? @relation("CommissionScheduleVersionChain", fields: [previousVersionId], references: [id])
+  supersededBy      CommissionSchedule[] @relation("CommissionScheduleVersionChain")
+
+  basis  CommissionBasis
+  status CommissionScheduleStatus @default(DRAFT)
+  /// Optional ceiling/floor on the TOTAL distributable base this schedule
+  /// version ever computes against, in minor units — p.23: "cap/floor".
+  capMinor   BigInt? @map("cap_minor")
+  floorMinor BigInt? @map("floor_minor")
+  /// Months this schedule keeps accruing after the underlying deal's own
+  /// activity ends (p.23: "survival") — null means indefinite/no
+  /// separately-tracked survival limit.
+  survivalMonths Int?    @map("survival_months")
+  description    String?
+
+  components CommissionComponent[]
+  revenueEvents RevenueEvent[]
+  accruals      CommissionAccrual[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([dealRoomId])
+  @@index([scheduleFamilyId])
+  @@index([dealRoomId, status])
+  @@map("commission_schedules")
+}
+
+/// the spec: "EconomicComponent || recipient, type, bps/percent/fixed,
+/// calculation basis, priority". `claimId` is the provenance link to the
+/// @tol/attribution Claim that justifies this recipient's share (scope
+/// p.23's AttributionLink concept, folded directly onto the component
+/// that needs it rather than a separate join table — a component IS
+/// already scoped to one schedule/one recipient, so a distinct
+/// AttributionLink row would only ever carry the same
+/// (scheduleId, claimId) pair this column already expresses). NULL for a
+/// PLATFORM-margin component, which has no claim behind it.
+model CommissionComponent {
+  id             String              @id @db.Uuid
+  scheduleId     String              @map("schedule_id") @db.Uuid
+  schedule       CommissionSchedule  @relation(fields: [scheduleId], references: [id])
+  recipientType  CommissionRecipientType @map("recipient_type")
+  recipientOrgId String              @map("recipient_org_id") @db.Uuid
+  recipientOrg   Organization        @relation("CommissionComponentRecipient", fields: [recipientOrgId], references: [id])
+  componentType  CommissionComponentType @map("component_type")
+  /// Required (and only meaningful) when componentType = PERCENTAGE_BPS.
+  bps Int?
+  /// Required (and only meaningful) when componentType = FIXED_AMOUNT.
+  fixedAmountMinor BigInt? @map("fixed_amount_minor")
+  /// NULL means "inherit the parent schedule's own `basis`" — see
+  /// packages/domain's selectComponentsForBasis for how a schedule can
+  /// mix components across more than one RevenueEvent basis.
+  calculationBasis CommissionBasis? @map("calculation_basis")
+  priority         Int
+  claimId          String? @map("claim_id") @db.Uuid
+  claim            Claim?  @relation(fields: [claimId], references: [id])
+
+  accruals CommissionAccrual[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([scheduleId])
+  @@index([recipientOrgId])
+  @@index([claimId])
+  @@map("commission_components")
+}
+
+/// the spec: "RevenueEvent || period, source, gross amount,
+/// deductions, net distributable". `basis` snapshots WHICH
+/// CommissionBasis this event's gross/deductions/net figures were
+/// resolved against (echoes the schedule's own basis, or a component's
+/// override — see packages/domain's selectComponentsForBasis) — recorded
+/// here rather than silently re-derived, same "snapshot, don't
+/// re-derive" precedent as ClaimDecision.scoreBreakdown (D10).
+/// `@@unique([dealRoomId, period, source])` prevents recording the same
+/// period's revenue twice under the same source label.
+model RevenueEvent {
+  id         String   @id @db.Uuid
+  dealRoomId String   @map("deal_room_id") @db.Uuid
+  dealRoom   DealRoom @relation(fields: [dealRoomId], references: [id])
+  scheduleId String             @map("schedule_id") @db.Uuid
+  schedule   CommissionSchedule @relation(fields: [scheduleId], references: [id])
+  basis      CommissionBasis
+
+  /// p.12: "Money || integer minor units + ISO currency; never floating
+  /// point" — BigInt throughout, see this section's header comment.
+  period            String
+  source            String
+  grossAmountMinor       BigInt @map("gross_amount_minor")
+  deductionsMinor        BigInt @default(0) @map("deductions_minor")
+  netDistributableMinor  BigInt @map("net_distributable_minor")
+  currency               String @db.Char(3)
+  recognizedAt           DateTime @map("recognized_at")
+
+  accruals CommissionAccrual[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@unique([dealRoomId, period, source])
+  @@index([dealRoomId])
+  @@index([scheduleId])
+  @@map("revenue_events")
+}
+
+/// THE TRACEABLE, APPEND-ONLY LEDGER this gate's exit condition names
+/// ("Traceable schedule/accrual ledger", p.33). One physical table
+/// carries both "the accrual" and every subsequent "ledger entry"
+/// against it — same append-only, no update()/no state-machine
+/// precedent as MatchResult (D12)/ReadinessResult (D11), extended here
+/// to a SEQUENCE of related rows rather than one row per computation.
+///
+/// `accrualRootId` is the grouping key: for an ACCRUAL-type row it is
+/// the row's OWN id (self-referential — legal because @tol/db's
+/// repository layer generates the UUIDv7 client-side via `newId()`
+/// BEFORE the insert, so the value is already known); for ADJUSTMENT/
+/// PAYMENT/REVERSAL rows it points at the ORIGINAL ACCRUAL row's id.
+/// packages/domain's computeAccrualBalance reduces every row sharing one
+/// `accrualRootId` into a single current balance + derived status — the
+/// status is NEVER a stored column here, matching D11/D12's own
+/// "callers read the latest/full history rather than a denormalized
+/// current-state pointer" precedent.
+///
+/// Every row carries the FULL provenance chain the spec mandates
+/// ("record inputVersion(s)... so historical decisions can be
+/// reproduced"): which deal, which revenue period, which schedule
+/// VERSION, which component (hence which rule), which attribution claim
+/// (if any) justified the recipient. `claimId`/`recipientOrgId` are
+/// denormalized off `componentId` at COMPUTE time (not read live off the
+/// component later) — same "snapshot, don't silently re-derive"
+/// precedent as ClaimDecision.scoreBreakdown (D10): if a schedule is
+/// later superseded or a component edited (components are otherwise
+/// update-never in this build — apps/api's economics service never
+/// exposes a component PATCH — but the denormalization is a real,
+/// deliberate safety net regardless), a historical ledger row's own
+/// recipient/claim never silently drifts.
+model CommissionAccrual {
+  id            String @id @db.Uuid
+  accrualRootId String @map("accrual_root_id") @db.Uuid
+  entryType     LedgerEntryType @map("entry_type")
+  direction     LedgerDirection
+  amountMinor   BigInt @map("amount_minor")
+  currency      String @db.Char(3)
+
+  dealRoomId String   @map("deal_room_id") @db.Uuid
+  dealRoom   DealRoom @relation(fields: [dealRoomId], references: [id])
+  revenueEventId String       @map("revenue_event_id") @db.Uuid
+  revenueEvent   RevenueEvent @relation(fields: [revenueEventId], references: [id])
+  scheduleId      String             @map("schedule_id") @db.Uuid
+  schedule        CommissionSchedule @relation(fields: [scheduleId], references: [id])
+  /// Snapshot of `schedule.versionNumber` AT COMPUTE TIME — the schedule
+  /// row itself may later be superseded; this stays historically
+  /// accurate regardless, same precedent as MatchResult.ruleVersion
+  /// (D12).
+  scheduleVersion Int @map("schedule_version")
+  componentId     String              @map("component_id") @db.Uuid
+  component       CommissionComponent @relation(fields: [componentId], references: [id])
+  recipientOrgId  String       @map("recipient_org_id") @db.Uuid
+  recipientOrg    Organization @relation("CommissionAccrualRecipient", fields: [recipientOrgId], references: [id])
+  claimId         String? @map("claim_id") @db.Uuid
+  claim           Claim?  @relation(fields: [claimId], references: [id])
+
+  /// Set only on PAYMENT-type rows — the richer CommissionPayment record
+  /// (reference/evidence/paidAt) this row's payment belongs to. scope
+  /// p.23's CommissionPayment.accrualIds (plural) is satisfied by this
+  /// FK running the other direction: one CommissionPayment can have
+  /// MANY PAYMENT-type CommissionAccrual rows pointing at it, one per
+  /// accrual it covers.
+  paymentId String?            @map("payment_id") @db.Uuid
+  payment   CommissionPayment? @relation(fields: [paymentId], references: [id])
+
+  /// Required (enforced in the service layer, not the schema) for
+  /// ADJUSTMENT/REVERSAL rows — the spec's Adjustment.reason.
+  reason String?
+  /// Soft references (no FK) — attribution metadata ("who approved
+  /// this"), same precedent as DealDecision.actorUserId/actorOrgId.
+  /// the spec's Adjustment.approver.
+  approverUserId String? @map("approver_user_id") @db.Uuid
+  approverOrgId  String? @map("approver_org_id") @db.Uuid
+
+  /// packages/domain's ECONOMICS_ENGINE_VERSION — the spec's own
+  /// "algorithmVersion" concept, named calculationVersion to match
+  /// the spec's own CommissionAccrual.calculationVersion field
+  /// verbatim.
+  calculationVersion String   @map("calculation_version")
+  inputVersions      Json     @default("[]") @map("input_versions")
+  /// Echoes the engine's own injected `now` — same MatchResult.evaluatedAt
+  /// precedent (D12).
+  computedAt         DateTime @map("computed_at")
+
+  // ---- base audit columns (p.12). `status` (RecordStatus) plays only
+  // its usual base-audit "is this row retired" role here, never an
+  // accrual-specific lifecycle — the REAL derived status is computed by
+  // packages/domain's computeAccrualBalance over every row sharing this
+  // row's accrualRootId, same "status column stays generic, real state
+  // is computed" precedent as MatchResult (D12). ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([accrualRootId])
+  @@index([dealRoomId])
+  @@index([revenueEventId])
+  @@index([recipientOrgId])
+  @@index([scheduleId])
+  @@index([paymentId])
+  @@map("commission_accruals")
+}
+
+/// the spec: "CommissionPayment || accrualIds, paid amount, date,
+/// reference, evidence". The "accrualIds" (plural) relationship is the
+/// REVERSE side of CommissionAccrual.paymentId — see that field's own
+/// comment.
+model CommissionPayment {
+  id             String       @id @db.Uuid
+  dealRoomId     String       @map("deal_room_id") @db.Uuid
+  dealRoom       DealRoom     @relation(fields: [dealRoomId], references: [id])
+  recipientOrgId String       @map("recipient_org_id") @db.Uuid
+  recipientOrg   Organization @relation("CommissionPaymentRecipient", fields: [recipientOrgId], references: [id])
+
+  /// Must equal SUM(this payment's PAYMENT-type CommissionAccrual rows'
+  /// amountMinor) exactly — validated by apps/api's economics service
+  /// before the transaction commits, same "prove it, don't just reason
+  /// about it" discipline as computeCommissionSplits' own internal
+  /// sum-check.
+  totalAmountMinor BigInt @map("total_amount_minor")
+  currency         String @db.Char(3)
+  paidAt           DateTime @map("paid_at")
+  /// Follow-up fix: @unique, DB-enforced. Doubles as this
+  /// payment's idempotency key -- a real bank ACH batch/wire
+  /// confirmation reference is generated once by the payer/processor
+  /// and is not reused across unrelated transactions in practice, and a
+  /// retried POST /deals/:id/economics/payments call (network timeout,
+  /// double-click) that resubmits the SAME reference must be rejected
+  /// at the DB level, not silently create a second CommissionPayment
+  /// row for the same real-world payment. This is a SEPARATE, coarser
+  /// backstop from shared/idempotency.ts's generic Idempotency-Key
+  /// header mechanism (which replays the whole cached response only
+  /// when the caller supplies that header) -- this constraint holds
+  /// even when a caller never sends one. Deferred out of the A2
+  /// advisory-lock pass (which fixed the concurrent-overpay race on
+  /// this same recordPayment() path) specifically to do the dev-DB
+  /// pollution cleanup this needed first (see the accompanying
+  /// migration + apps/api/tests/integration/economics.test.ts's own
+  /// fix for the two hardcoded literals that caused it).
+  reference   String  @unique
+  evidenceRef String? @map("evidence_ref")
+
+  accrualEntries CommissionAccrual[]
+
+  // ---- base audit columns (p.12) ----
+  createdAt       DateTime        @default(now()) @map("created_at")
+  createdByUserId String?         @map("created_by_user_id") @db.Uuid
+  createdByOrgId  String?         @map("created_by_org_id") @db.Uuid
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  updatedByUserId String?         @map("updated_by_user_id") @db.Uuid
+  status          RecordStatus    @default(ACTIVE)
+  version         Int             @default(1)
+  privacyClass    DisclosureClass @default(RESTRICTED) @map("privacy_class")
+  sourceType      SourceType      @default(PLATFORM) @map("source_type")
+  sourceReference String?         @map("source_reference")
+  effectiveFrom   DateTime?       @map("effective_from")
+  effectiveTo     DateTime?       @map("effective_to")
+  retiredAt       DateTime?       @map("retired_at")
+
+  @@index([dealRoomId])
+  @@index([recipientOrgId])
+  @@map("commission_payments")
+}

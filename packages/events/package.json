@@ -1,0 +1,21 @@
+{
+  "name": "@tol/events",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Domain event definitions (the spec names ~24 events, e.g. rfq.sent, quote.selected, deal.activated). Distinct from AuditEvent — domain events are append-only business facts; audit events capture who viewed/changed restricted values. earlier: the RFQ + Deal Room event catalog, the substrate for P14's 'timeline' surface. Zero runtime dependencies, same discipline as @tol/authz/@tol/domain — persistence-agnostic; @tol/db's DomainEvent table + domainEventRepository (packages/db) is where these actually get written, apps/api's services do the mapping.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "devDependencies": {
+    "@tol/domain": "workspace:*",
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

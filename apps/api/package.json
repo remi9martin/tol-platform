@@ -1,0 +1,39 @@
+{
+  "name": "@tol/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Fastify service. route -> service -> repository layering; services open transactions, invoke domain rules and repositories, enqueue outbox events (the spec). Never calls Prisma directly — that's @tol/db's job.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/cookie": "11.1.2",
+    "@fastify/cors": "11.3.0",
+    "@fastify/rate-limit": "11.2.0",
+    "@tol/attribution": "workspace:*",
+    "@tol/authz": "workspace:*",
+    "@tol/config": "workspace:*",
+    "@tol/contracts": "workspace:*",
+    "@tol/crypto": "workspace:*",
+    "@tol/db": "workspace:*",
+    "@tol/domain": "workspace:*",
+    "@tol/events": "workspace:*",
+    "@tol/evidence": "workspace:*",
+    "@tol/matching": "workspace:*",
+    "@tol/queue": "workspace:*",
+    "fastify": "5.12.0",
+    "fastify-plugin": "6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "tsx": "4.23.12",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

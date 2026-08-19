@@ -1,0 +1,98 @@
+name: Migration Check
+
+# Gate: P18 Security. A schema/migration mismatch is a security-relevant
+# class of bug here specifically because packages/db is described (its own
+# package.json) as "the only package that talks to PostgreSQL directly" —
+# every authz/tenant-isolation/redaction guarantee in packages/authz
+# ultimately rests on the DB actually having the columns/constraints
+# schema.prisma claims it has. Undetected drift (someone edits
+# schema.prisma without generating a migration, or hand-edits a migration
+# file after it shipped) is exactly the kind of gap that stays invisible
+# until it silently breaks a production deploy or, worse, a security
+# invariant.
+#
+# AUTHORED, NOT YET EXERCISED — see ci.yml's header comment (no GitHub
+# remote yet; action versions verified live at authoring time, 2026-08-18).
+#
+# Scope: this workflow checks ONE thing — that packages/db/prisma/
+# migrations, replayed in order, produce exactly the state packages/db/
+# prisma/schema.prisma currently declares (no drift). It deliberately does
+# NOT re-prove "migrations apply cleanly to a fresh DB" — ci.yml's own
+# `prisma:migrate:deploy` step against a fresh Postgres service container
+# already exercises that on every push/PR; duplicating it here would just
+# be the same assertion under a different workflow name.
+
+on:
+  push:
+    branches: [master] # see ci.yml's note — tol-platform's real current default branch.
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Only DATABASE_URL is needed here — `prisma migrate diff` doesn't boot
+  # apps/api or call @tol/config's getConfig(), so none of ci.yml's other
+  # CI-only dummy secrets (SESSION_SECRET, LOCKBOX_KEK_*) apply to this
+  # workflow. Kept as the same .env.example-documented placeholder value
+  # ci.yml uses, for the same reason (it's the local-dev default, not a
+  # real credential).
+  DATABASE_URL: postgresql://tol:changeme@localhost:5432/tol_platform
+
+jobs:
+  drift-check:
+    name: Prisma schema/migration drift check
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tol
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: tol_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tol"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: ".nvmrc"
+          cache: "pnpm"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # `prisma migrate diff --from-migrations` needs a scratch database to
+      # replay the migration history into before it can diff the result
+      # against schema.prisma's current datamodel. The postgres service
+      # above only auto-creates ONE database (tol_platform, via
+      # POSTGRES_DB) — this creates a second, empty one for Prisma to use
+      # as that scratch space. postgresql-client ships preinstalled on
+      # GitHub's ubuntu-latest runner image, so no extra install step is
+      # needed for psql itself.
+      - name: Create shadow database
+        run: PGPASSWORD=changeme psql -h localhost -U tol -d tol_platform -c "CREATE DATABASE tol_platform_shadow;"
+
+      # --exit-code makes this command exit 2 (not 0) if the migrations
+      # history and the current schema.prisma disagree — that nonzero
+      # exit fails this step (and therefore the job) automatically; no
+      # extra failure handling needed here. A clean run (no drift) exits 0.
+      - name: Check for schema drift
+        working-directory: packages/db
+        run: |
+          pnpm exec prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url postgresql://tol:changeme@localhost:5432/tol_platform_shadow \
+            --exit-code

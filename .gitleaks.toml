@@ -1,0 +1,59 @@
+title = "tol-platform gitleaks config"
+
+# Gate: P18 Security. Run by .github/workflows/security.yml's gitleaks
+# job (gitleaks/gitleaks-action@v3), which discovers this file
+# automatically at the repo root — no --config flag needed.
+#
+# AUTHORED, NOT YET EXERCISED — see .github/workflows/ci.yml's header
+# comment (no GitHub remote yet).
+#
+# Strategy: inherit gitleaks' full built-in ruleset (AWS/GCP/Azure/Stripe/
+# GitHub/Slack/private-key/generic-high-entropy detectors, etc.) rather
+# than hand-rolling detection rules for this repo — this repo has no
+# exotic proprietary token format that needs a bespoke regex; every real
+# secret it handles (GOOGLE_OAUTH_CLIENT_SECRET,
+# S3_SECRET_ACCESS_KEY, the LOCKBOX_KEK_*/session/receipt keys, etc. — see
+# .env.example) is a conventional shape the default ruleset's generic-
+# api-key and provider-specific rules already cover. What THIS file adds
+# is the allowlist: known-safe patterns specific to this repo that would
+# otherwise be false positives.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths that structurally cannot contain a real secret, or are already git-ignored"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''(^|/)\.next/''',
+  '''(^|/)\.turbo/''',
+  '''(^|/)coverage/''',
+  '''(^|/)pnpm-lock\.yaml$''',        # package integrity hashes (base64 SHA-512) are classic false-positive bait for generic high-entropy rules — not secrets.
+  '''(^|/)\.env\.example$''',         # this file's own header is explicit: "All values below are placeholders, not real secrets." Real .env is gitignored and never committed in the first place.
+  '''\.test\.tsx?$''',                # unit/integration test fixtures across the workspace commonly hardcode dummy key material (e.g. packages/crypto/src/keys.test.ts's parseKeyHex fixtures) that is structurally identical in shape to a real key but never is one. Path-allowlisted rather than enumerating every fixture literal by hand — see docs/security/README.md's residual-risk note on periodically spot-checking these stay dummy.
+  '''\.spec\.tsx?$''',
+  '''(^|/)infra/docker/\.data/''',    # local Docker volume mounts — gitignored, never committed, allowlisted defensively.
+  '''(^|/)infra/terraform/\.terraform''',
+]
+
+# Exact CI-only dummy values that are DELIBERATELY committed in plaintext
+# in .github/workflows/ci.yml (and reused in migration-check.yml's
+# DATABASE_URL) — see that file's own header comment for the full
+# reasoning. These exist only to satisfy packages/config/src/env.ts's
+# fail-loud validation and packages/crypto/src/keys.ts's 64-hex-char
+# format check on an ephemeral GitHub-hosted runner talking to a
+# throwaway Postgres service container; they are never used outside CI
+# and are not connected to any real KMS/HSM key material (ADR-0009).
+# Listed as exact-value regexes (not a path exclusion) because
+# ci.yml is real, functional content that should otherwise stay fully
+# scanned.
+regexes = [
+  '''ci-only-dummy-session-secret-never-used-outside-ephemeral-test-runs''',
+  '''a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4''',
+  '''e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718e5f60718''',
+  '''293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c293a4b5c''',
+  '''6d7e8f906d7e8f906d7e8f906d7e8f906d7e8f906d7e8f906d7e8f906d7e8f90''',
+  '''tol:changeme@localhost:5432''',  # .env.example's own documented local-dev placeholder Postgres credential, reused verbatim in ci.yml/migration-check.yml's service-container DATABASE_URL — not a real credential (see .env.example's header: "All values below are placeholders, not real secrets").
+]

@@ -1,0 +1,26 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tol-api",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@tol/api", "run", "dev"],
+      "port": 18400,
+      "url": "http://localhost:18400"
+    },
+    {
+      "name": "tol-web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@tol/web", "run", "dev"],
+      "port": 18300,
+      "url": "http://localhost:18300"
+    },
+    {
+      "name": "tol-worker",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@tol/worker", "run", "dev"],
+      "port": 18500,
+      "url": "http://localhost:18500"
+    }
+  ]
+}

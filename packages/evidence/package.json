@@ -1,0 +1,20 @@
+{
+  "name": "@tol/evidence",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Provenance, freshness classes (FRESH/AGING/STALE/UNKNOWN) and readiness rules (the spec, p.16) shared by Passport (P6) and Capacity (P8) — both need the same staleness/blocker/warning machinery. earlier: real content — computeReadiness() (Passport's ReadinessResult engine) and classifyCapacityFreshness() (replacing the client-supplied CapacityProfile.freshnessClass with a real deterministic classifier). Zero runtime dependencies, same discipline as @tol/domain/@tol/authz/@tol/crypto/@tol/attribution. Pure, zero-DB, zero-clock (every function takes an explicit reference time — never reads Date.now() internally).",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

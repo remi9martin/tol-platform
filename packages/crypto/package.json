@@ -1,0 +1,20 @@
+{
+  "name": "@tol/crypto",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Lockbox crypto core (earlier, P9): real AES-256-GCM authenticated encryption via Node's built-in crypto, envelope encryption with a per-lockbox DEK, Shamir (2-of-3) threshold secret sharing over the DEK (SEALER/OPERATOR/ESCROW roles — see ADR-0001/ADR-0009), and signed receipts (HMAC-SHA256). Zero runtime dependencies — Node's own crypto module supplies every primitive. Pure, zero-DB; apps/api's lockbox module is the only consumer. See docs/adr/0009-lockbox-crypto.md.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

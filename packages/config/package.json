@@ -1,0 +1,20 @@
+{
+  "name": "@tol/config",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Typed environment/config loader shared by apps/api, apps/worker and infra scripts. Single place that reads process.env and fails loudly on missing/malformed config, instead of every app doing it ad hoc.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

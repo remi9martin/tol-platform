@@ -1,0 +1,20 @@
+{
+  "name": "@tol/attribution",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Relationship claim scoring + dispute path (the spec). One of the four business-invariant packages named on the spec. earlier (P10): a deterministic, explainable four-factor scoring engine — HISTORY (40%) + PROXIMITY (30%) + EVIDENCE (20%) + TIME (10%), the spec's own weights verbatim — plus a ranking function for competing claims. Zero runtime dependencies, same discipline as @tol/domain/@tol/authz/@tol/crypto. Pure, zero-DB — apps/api's claims module (this stage) is the only consumer of the persisted form.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

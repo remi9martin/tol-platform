@@ -1,0 +1,20 @@
+{
+  "name": "@tol/domain",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Entities, states, invariants, domain services (the spec). earlier: money/minor-units safety helpers and the RFQ/Quote/DealRoom/DealCondition state-transition graphs — 'Transitions happen through domain services, never arbitrary UI field edits' (the spec STATE RULE). Zero runtime dependencies, same discipline as @tol/authz (see its README) — apps/api's services call these BEFORE invoking @tol/db repositories, which stay persistence-thin.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

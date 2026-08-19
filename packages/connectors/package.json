@@ -1,0 +1,14 @@
+{
+  "name": "@tol/connectors",
+  "version": "0.0.0",
+  "private": true,
+  "description": "ProviderConnector interface SDK + implementations (the spec). MVP scope is deliberately narrow: one fake + one representative real/sandbox adapter (the spec, 'deliberately deferred'). No dedicated P-gate; supports Opportunity intake (P7) and Capacity (P8) evidence feeds, and the Pilot (P19) end-to-end loop.",
+  "type": "module",
+  "scripts": {
+    "build": "echo \"@tol/connectors: no build defined yet (earlier skeleton)\"",
+    "lint": "echo \"@tol/connectors: no lint defined yet (earlier skeleton)\"",
+    "test": "echo \"@tol/connectors: no tests defined yet (earlier skeleton)\""
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts"
+}

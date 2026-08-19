@@ -1,0 +1,23 @@
+{
+  "name": "@tol/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Zod DTOs + generated OpenAPI schemas (the spec, p.11). Single source of truth for request/response shapes; apps/web's API client and apps/api's route validation both derive from here. OpenAPI is generated from this package and checked in CI for breaking changes.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

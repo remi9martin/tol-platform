@@ -1,0 +1,58 @@
+# Local dev infrastructure for TOL Platform.
+# Current status: only the four infra services below are real. The api/worker
+# services are commented out — they need infra/docker/*.Dockerfile, which
+# don't exist yet (no implementation has been ported/built). Nothing here
+# is deployed; this is local-dev-only, matching the "Do NOT deploy" constraint
+# of the current phase.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tol
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: tol_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./infra/docker/.data/postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./infra/docker/.data/redis:/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: changeme
+      MINIO_ROOT_PASSWORD: changeme
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./infra/docker/.data/minio:/data
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  # api:
+  #   build:
+  #     context: .
+  #     dockerfile: infra/docker/api.Dockerfile   # does not exist yet
+  #   depends_on: [postgres, redis]
+  #   env_file: .env
+  #   ports: ["4000:4000"]
+
+  # worker:
+  #   build:
+  #     context: .
+  #     dockerfile: infra/docker/worker.Dockerfile  # does not exist yet
+  #   depends_on: [postgres, redis]
+  #   env_file: .env

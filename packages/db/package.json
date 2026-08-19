@@ -1,0 +1,38 @@
+{
+  "name": "@tol/db",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Prisma schema, migrations, repositories. The only package that talks to PostgreSQL directly; apps/api and apps/worker consume repositories, never the Prisma client directly.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "test": "vitest run",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:seed": "tsx prisma/seed.ts",
+    "prisma:studio": "prisma studio"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "@tol/attribution": "workspace:*",
+    "@tol/domain": "workspace:*",
+    "@tol/evidence": "workspace:*",
+    "@tol/matching": "workspace:*",
+    "bcryptjs": "3.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "prisma": "6.19.3",
+    "tsx": "4.23.12",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
